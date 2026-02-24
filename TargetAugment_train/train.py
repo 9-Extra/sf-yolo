@@ -110,7 +110,7 @@ def main():
     parser.add_argument("--content_style_weight", type=float, default=1)
     parser.add_argument("--constrain_weight", type=float, default=1)
     parser.add_argument("--before_fcs_steps", type=int, default=0)
-    parser.add_argument("--device", type=str, default=0)
+    parser.add_argument("--device", type=str, default="0")
     args = parser.parse_args()
 
     assert args.scenario_name in [

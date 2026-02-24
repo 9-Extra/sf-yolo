@@ -1,4 +1,3 @@
-from shutil import copy
 from tqdm import tqdm
 import argparse
 import os
@@ -38,7 +37,7 @@ def main():
         for root, _, files in os.walk(subfolder_images_path):
             for file in tqdm(files):
                 if file.endswith(args.image_suffix):
-                    copy(
+                    os.link(
                         os.path.join(root, file),
                         os.path.join(dir_images, file),
                     )
