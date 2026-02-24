@@ -1,4 +1,8 @@
+__pycache__
+
 /.venv
 /.marscode
 /TargetAugment_train/data/city2foggy
-__pycache__
+/datasets
+/runs
+/source_weights/yolov5l_cityscapes.pt
