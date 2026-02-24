@@ -1,0 +1,4 @@
+/.venv
+/.marscode
+/TargetAugment_train/data/city2foggy
+__pycache__

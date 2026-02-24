@@ -3,31 +3,46 @@ from tqdm import tqdm
 import argparse
 import os
 
-parser = argparse.ArgumentParser()
 
-parser.add_argument('--images_folder', type=str, required=True,
-                    help='The path to the images folder')
-parser.add_argument('--scenario_name', type=str, required=True,choices=['city2foggy'],help='The name of the scenario')
-parser.add_argument('--image_suffix', type=str, default='jpg',help='image suffix')
+def main():
 
-args = parser.parse_args()
+    parser = argparse.ArgumentParser()
 
-images_path=args.images_folder
-dataset=args.scenario_name
+    parser.add_argument(
+        "--images_folder", type=str, required=True, help="The path to the images folder"
+    )
+    parser.add_argument(
+        "--scenario_name",
+        type=str,
+        required=True,
+        choices=["city2foggy"],
+        help="The name of the scenario",
+    )
+    parser.add_argument("--image_suffix", type=str, default="jpg", help="image suffix")
 
-dir_images=os.path.join('data',dataset)
+    args = parser.parse_args()
 
-dir=os.path.join('data',dataset)
-if not os.path.exists(dir):
-    os.makedirs(dir)
+    images_path = args.images_folder
+    dataset = args.scenario_name
 
-subfolders = ['train']
+    dir_images = os.path.join("data", dataset)
 
-for subfolder in subfolders:
-    subfolder_images_path = os.path.join(images_path, subfolder)
-    image_files = os.listdir(subfolder_images_path)
+    dir = os.path.join("data", dataset)
+    if not os.path.exists(dir):
+        os.makedirs(dir)
 
-    for image_file in tqdm(image_files):
-        if image_file.endswith(args.image_suffix):
-            base_filename = os.path.splitext(image_file)[0]
-            copy(os.path.join(subfolder_images_path, image_file), os.path.join(dir_images, image_file))
+    subfolders = ["train"]
+
+    for subfolder in subfolders:
+        subfolder_images_path = os.path.join(images_path, subfolder)
+        for root, _, files in os.walk(subfolder_images_path):
+            for file in tqdm(files):
+                if file.endswith(args.image_suffix):
+                    copy(
+                        os.path.join(root, file),
+                        os.path.join(dir_images, file),
+                    )
+
+
+if __name__ == "__main__":
+    main()
