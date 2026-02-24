@@ -6,3 +6,4 @@ __pycache__
 /datasets
 /runs
 /source_weights/yolov5l_cityscapes.pt
+.ipynb_checkpoints
