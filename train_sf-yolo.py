@@ -165,18 +165,27 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     amp = False
 
     # Freeze
-    freeze_student = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
+    # 解析需要冻结的层，freeze 参数可以是单个数字或层索引列表
+    # 示例: --freeze 10  -> 冻结 model.0 到 model.9 (backbone)
+    #       --freeze 0 1 2 -> 冻结 model.0, model.1, model.2
+    #       --freeze 0 (默认) -> 不冻结任何层，训练全部参数
+    freeze_student = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # 需要冻结的层名称列表
+    
+    # 遍历学生模型的所有参数，设置是否可训练
     for k, v in model_student.named_parameters():
-        v.requires_grad = True  # train all layers
-        # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
+        v.requires_grad = True  # 默认所有层都参与训练
+        # v.register_hook(lambda x: torch.nan_to_num(x))  # 将 NaN 转为 0（已注释，避免训练不稳定）
+        # 如果参数名称匹配冻结列表中的任何一层，则冻结该参数
         if any(x in k for x in freeze_student):
             LOGGER.info(f'freezing student {k}')
             v.requires_grad = False
-            
-    freeze_teacher = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
+    
+    # 对学生模型和教师模型应用相同的冻结策略
+    # 教师模型使用 EMA 更新，但在初始化时也需要设置一致的冻结状态
+    freeze_teacher = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # 需要冻结的层名称列表
     for k, v in model_teacher.named_parameters():
-        v.requires_grad = True  # train all layers
-        # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
+        v.requires_grad = True  # 默认所有层都参与训练
+        # v.register_hook(lambda x: torch.nan_to_num(x))  # 将 NaN 转为 0（已注释，避免训练不稳定）
         if any(x in k for x in freeze_teacher):
             LOGGER.info(f'freezing student {k}')
             v.requires_grad = False
@@ -320,7 +329,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model_student)  # init loss class
     callbacks.run('on_train_start')
