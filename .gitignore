@@ -10,3 +10,4 @@ __pycache__
 .ipynb_checkpoints
 
 /TargetAugment_train/models/
+/yolo*.pt
