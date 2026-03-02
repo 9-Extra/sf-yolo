@@ -324,53 +324,7 @@ def git_describe(path=ROOT):  # path must be a directory
         return check_output(f'git -C {path} describe --tags --long --always', shell=True).decode()[:-1]
     except Exception:
         return ''
-
-
-@TryExcept()
-@WorkingDirectory(ROOT)
-def check_git_status(repo='ultralytics/yolov5', branch='master'):
-    # YOLOv5 status check, recommend 'git pull' if code is out of date
-    url = f'https://github.com/{repo}'
-    msg = f', for updates see {url}'
-    s = colorstr('github: ')  # string
-    assert Path('.git').exists(), s + 'skipping check (not a git repository)' + msg
-    assert check_online(), s + 'skipping check (offline)' + msg
-
-    splits = re.split(pattern=r'\s', string=check_output('git remote -v', shell=True).decode())
-    matches = [repo in s for s in splits]
-    if any(matches):
-        remote = splits[matches.index(True) - 1]
-    else:
-        remote = 'ultralytics'
-        check_output(f'git remote add {remote} {url}', shell=True)
-    check_output(f'git fetch {remote}', shell=True, timeout=5)  # git fetch
-    local_branch = check_output('git rev-parse --abbrev-ref HEAD', shell=True).decode().strip()  # checked out
-    n = int(check_output(f'git rev-list {local_branch}..{remote}/{branch} --count', shell=True))  # commits behind
-    if n > 0:
-        pull = 'git pull' if remote == 'origin' else f'git pull {remote} {branch}'
-        s += f"⚠️ YOLOv5 is out of date by {n} commit{'s' * (n > 1)}. Use '{pull}' or 'git clone {url}' to update."
-    else:
-        s += f'up to date with {url} ✅'
-    LOGGER.info(s)
-
-
-@WorkingDirectory(ROOT)
-def check_git_info(path='.'):
-    # YOLOv5 git info check, return {remote, branch, commit}
-    check_requirements('gitpython')
-    import git
-    try:
-        repo = git.Repo(path)
-        remote = repo.remotes.origin.url.replace('.git', '')  # i.e. 'https://github.com/ultralytics/yolov5'
-        commit = repo.head.commit.hexsha  # i.e. '3134699c73af83aac2a481435550b968d5792c0d'
-        try:
-            branch = repo.active_branch.name  # i.e. 'main'
-        except TypeError:  # not on any branch
-            branch = None  # i.e. 'detached HEAD' state
-        return {'remote': remote, 'branch': branch, 'commit': commit}
-    except git.exc.InvalidGitRepositoryError:  # path is not a git dir
-        return {'remote': None, 'branch': None, 'commit': None}
-
+        
 
 def check_python(minimum='3.8.0'):
     # Check current python version vs. required python version

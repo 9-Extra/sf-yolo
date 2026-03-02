@@ -8,10 +8,11 @@ import torch
 import os
 
 def main():
+    torch.set_float32_matmul_precision('medium')
     # Configuration
-    DATA_YAML = "/home/featurize/work/sf-yolo/data/cityscapes_original.yaml"
-    MODEL_NAME = "yolo26l.pt"  # Nano version (smallest, fastest)
-    # Alternative models: yolo26s.pt, yolo26m.pt, yolo26l.pt, yolo26x.pt
+    DATA_YAML = "datasets/cityscape-yolo/cityscapes.yaml"
+    MODEL_NAME = "yolo26l.pt"
+    # models: yolo26n.pt, yolo26s.pt, yolo26m.pt, yolo26l.pt, yolo26x.pt
 
     EPOCHS = 100
     IMGSZ = 960
@@ -46,10 +47,11 @@ def main():
         patience=PATIENCE,
         project=PROJECT,
         
-        cache="disk",
-        exist_ok=True,
+        amp=True,
+        cache="memory",
+        exist_ok=False,
         pretrained=True,
-        optimizer="SGD",
+        optimizer="MuSGD",
         lr0=0.01,
         lrf=0.01,
         momentum=0.937,
@@ -73,14 +75,8 @@ def main():
         cutmix=0.0,
         copy_paste=0.0,
         verbose=True,
-        resume=True,
         compile=True
     )
-
-    print("\n" + "=" * 60)
-    print("✅ Training completed!")
-    print(f"Results saved to: {PROJECT}/{NAME}")
-    print("=" * 60)
 
     # Validate on test set
     print("\n🧪 Running validation...")

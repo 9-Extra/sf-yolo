@@ -18,13 +18,6 @@
 export UV_PROJECT_ENVIRONMENT=/home/featurize/venv
 ```
 
-建议将此行添加到 `~/.bashrc` 或 `~/.zshrc` 中以确保持久生效：
-
-```bash
-echo 'export UV_PROJECT_ENVIRONMENT=/home/featurize/venv' >> ~/.bashrc
-source ~/.bashrc
-```
-
 ## 使用 uv 运行脚本
 
 ### 运行 Python 脚本
@@ -105,7 +98,7 @@ model = YOLO("yolo26n.pt")
 
 # 训练配置
 results = model.train(
-    data="/home/featurize/work/sf-yolo/data/cityscapes_original.yaml",
+    data="datasets/cityscape-yolo/cityscapes.yaml",
     epochs=100,
     imgsz=960,
     batch=16,
@@ -144,7 +137,7 @@ model = YOLO("runs/train_yolo26/cityscapes_baseline/weights/best.pt")
 
 # 在源域（Cityscapes）验证
 metrics_source = model.val(
-    data="/home/featurize/work/sf-yolo/data/cityscapes_original.yaml",
+    data="datasets/cityscape-yolo/cityscapes.yaml",
     imgsz=960,
     batch=16,
     verbose=False
@@ -153,7 +146,7 @@ print(f"Source - mAP@50: {metrics_source.box.map50:.4f}")
 
 # 在目标域（Foggy Cityscapes）验证
 metrics_target = model.val(
-    data="/home/featurize/work/sf-yolo/data/foggy_cityscapes.yaml",
+    data="datasets/cityscape-foggy-yolo/cityscapes.yaml",
     imgsz=960,
     batch=16,
     verbose=False
@@ -174,7 +167,7 @@ uv run python validate_yolo26.py
 ```bash
 uv run val.py \
     --weights source_weights/yolov5l_cityscapes.pt \
-    --data data/cityscapes_original.yaml \
+    --data datasets/cityscape-yolo/cityscapes.yaml \
     --imgsz 960 \
     --batch-size 16 \
     --task val
@@ -184,7 +177,7 @@ uv run val.py \
 ```bash
 uv run val.py \
     --weights source_weights/yolov5l_cityscapes.pt \
-    --data data/foggy_cityscapes.yaml \
+    --data datasets/cityscape-foggy-yolo/cityscapes.yaml \
     --imgsz 960 \
     --batch-size 16 \
     --task val
@@ -194,24 +187,5 @@ uv run val.py \
 
 #### Cityscapes 原始数据（源域）
 
-确保原始 Cityscapes 数据已转换为 YOLO 格式：
+需要使用cityscape2yolo.py预先将原始 Cityscapes 数据已转换为 YOLO 格式
 
-```bash
-# 原始 Cityscapes → YOLO 格式
-uv run cityscape2yolo.py \
-    --image_path /home/featurize/cityscape/leftImg8bit \
-    --source_label_path /home/featurize/cityscape/gtFine \
-    --output_dir /home/featurize/datasets/cityscape-yolo \
-    --foggy_beta ""
-```
-
-#### Foggy Cityscapes（目标域）
-
-```bash
-# Foggy Cityscapes → YOLO 格式
-uv run cityscape2yolo.py \
-    --image_path /home/featurize/leftImg8bit_foggy \
-    --source_label_path /home/featurize/cityscape/gtFine \
-    --output_dir /home/featurize/datasets/cityscape-foggy-yolo \
-    --foggy_beta _foggy_beta_0.02
-```
