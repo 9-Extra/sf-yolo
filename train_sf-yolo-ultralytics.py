@@ -131,7 +131,7 @@ class SFYOLOTrainer(DetectionTrainer):
         self.debug_mode = overrides.pop('debug_mode', False)
         self.debug_interval = overrides.pop('debug_interval', 50)  # 每N个batch保存一次
         self.debug_counter = 0
-        self.debug_save_dir = Path(overrides.pop('debug_save_dir', './check'))
+        self.debug_save_dir = Path(overrides.pop('debug_save_dir', './check/teacher_output'))
         if self.debug_mode:
             self.debug_save_dir.mkdir(parents=True, exist_ok=True)
             LOGGER.info(f"{colorstr('SF-YOLO:')} Test mode 已启用，伪标签将保存到 {self.debug_save_dir}")
@@ -230,6 +230,187 @@ class SFYOLOTrainer(DetectionTrainer):
         
         return pred_nms
     
+    def _save_student_output(self, imgs_style, preds_student, pseudo_labels, batch_idx):
+        """保存学生模型的输出可视化（与教师伪标签对比）
+        
+        使用与 Ultralytics Detect 头相同的解码逻辑：
+        1. 训练时使用 one2many 头的输出
+        2. 通过 dfl() 解码 Distribution Focal Loss
+        3. 使用 decode_bboxes() 转换为 xyxy 坐标
+        4. 应用 sigmoid 到 scores
+        
+        Args:
+            imgs_style: 风格化图像张量 (B, C, H, W)，范围 [0, 1]
+            preds_student: 学生模型的原始预测输出（训练模式下的字典格式）
+            pseudo_labels: 教师模型生成的伪标签（用于对比）
+            batch_idx: 当前batch索引
+        """
+        if not self.debug_mode:
+            return
+        
+        student_save_dir = Path(self.debug_save_dir) / "student_output"
+        student_save_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            with torch.no_grad():
+                # 获取模型头部信息
+                model_head = self.model.model[-1] if hasattr(self.model, 'model') else self.model.module.model[-1]
+                
+                # 处理 end2end 模型的输出格式
+                # YOLOv26 训练时返回 {'one2many': {...}, 'one2one': {...}}
+                # 我们使用 one2many 头（训练头）的输出来与学生模型的训练状态一致
+                if isinstance(preds_student, dict):
+                    if "one2many" in preds_student:
+                        preds_student = preds_student["one2many"]
+                
+                # 使用 Detect 头的内部方法解码预测
+                # 参考: ultralytics/nn/modules/head.py 中的 _inference() 和 _get_decode_boxes()
+                
+                # 1. 创建锚点 (anchors) 和步长 (strides)
+                # 参考: ultralytics/nn/modules/head.py 中的 _get_decode_boxes()
+                from ultralytics.utils.tal import make_anchors
+                feats = preds_student["feats"]
+                stride = model_head.stride
+                anchors, strides = make_anchors(feats, stride, 0.5)
+                # anchors: [num_anchors, 2], strides: [num_anchors, 1]
+                # 需要转置 anchors 以匹配 boxes 的维度 [batch, 4, num_anchors]
+                anchors = anchors.t().unsqueeze(0)  # [1, 2, num_anchors]
+                strides = strides.view(1, 1, -1)  # [1, 1, num_anchors]
+                
+                # 2. 解码边界框
+                # boxes: [batch, 4*reg_max, num_anchors]
+                pred_distri = preds_student["boxes"]  # [batch, 4*reg_max, num_anchors]
+                
+                # 应用 DFL 解码 (Distribution Focal Loss)，当 reg_max > 1 时
+                if model_head.reg_max > 1:
+                    pred_bboxes = model_head.decode_bboxes(model_head.dfl(pred_distri), anchors)
+                else:
+                    # reg_max == 1 时，boxes 直接是 [batch, 4, num_anchors]，跳过 DFL
+                    pred_bboxes = model_head.decode_bboxes(pred_distri, anchors)
+                
+                # 乘以 strides 得到最终坐标
+                pred_bboxes = pred_bboxes * strides  # [batch, num_anchors, 4]
+                # pred_bboxes: [batch, num_anchors, 4] in xyxy format
+                
+                # 3. 对 scores 应用 sigmoid
+                # scores: [batch, nc, num_anchors]
+                pred_scores = preds_student["scores"].sigmoid()  # [batch, nc, num_anchors]
+                
+                # 4. 合并预测结果 [batch, 4+nc, num_anchors]
+                # 注意：NMS 期望的输入格式是 [batch, 4+nc, num_anchors]
+                # pred_bboxes: [batch, 4, num_anchors]
+                # pred_scores: [batch, nc, num_anchors]
+                preds_combined = torch.cat([pred_bboxes, pred_scores], dim=1)  # [batch, 4+nc, num_anchors]
+                
+                # 5. 应用 NMS
+                student_preds = non_max_suppression(
+                    preds_combined,
+                    conf_thres=self.conf_thres,
+                    iou_thres=self.iou_thres,
+                    multi_label=True,
+                    agnostic=self.args.single_cls,
+                    max_det=self.max_det,
+                )
+        except Exception as e:
+            LOGGER.warning(f"解码学生模型输出失败: {e}")
+            import traceback
+            LOGGER.warning(traceback.format_exc())
+            return
+        
+        # 只保存前2张图像
+        num_save = min(2, imgs_style.shape[0])
+        
+        for i in range(num_save):
+            # 转换图像为numpy格式
+            img_style = imgs_style[i].cpu().permute(1, 2, 0).numpy() * 255
+            img_style = img_style.astype(np.uint8).copy()
+            img_style = cv2.cvtColor(img_style, cv2.COLOR_RGB2BGR)
+            
+            h, w = img_style.shape[:2]
+            
+            # 创建对比图像：左列=教师伪标签，右列=学生预测
+            img_teacher = img_style.copy()
+            img_student = img_style.copy()
+            
+            # 绘制教师伪标签（红色）
+            teacher_labels = pseudo_labels[i]
+            teacher_count = 0
+            if teacher_labels is not None and len(teacher_labels) > 0:
+                teacher_count = len(teacher_labels)
+                for det in teacher_labels:
+                    x1, y1, x2, y2, conf, cls = det.cpu().numpy()[:6]
+                    x1, y1, x2, y2 = max(0, int(x1)), max(0, int(y1)), min(w, int(x2)), min(h, int(y2))
+                    color = (0, 0, 255)  # 红色 - 教师
+                    cv2.rectangle(img_teacher, (x1, y1), (x2, y2), color, 2)
+                    label_text = f"T:{int(cls)} {conf:.2f}"
+                    (text_w, text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    cv2.rectangle(img_teacher, (x1, y1 - text_h - 4), (x1 + text_w, y1), color, -1)
+                    cv2.putText(img_teacher, label_text, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            else:
+                cv2.putText(img_teacher, "NO TEACHER LABELS", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            
+            # 绘制学生预测（蓝色）
+            student_labels = student_preds[i]
+            student_count = 0
+            if student_labels is not None and len(student_labels) > 0:
+                student_count = len(student_labels)
+                for det in student_labels:
+                    x1, y1, x2, y2, conf, cls = det.cpu().numpy()[:6]
+                    x1, y1, x2, y2 = max(0, int(x1)), max(0, int(y1)), min(w, int(x2)), min(h, int(y2))
+                    color = (255, 0, 0)  # 蓝色 - 学生
+                    cv2.rectangle(img_student, (x1, y1), (x2, y2), color, 2)
+                    label_text = f"S:{int(cls)} {conf:.2f}"
+                    (text_w, text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    cv2.rectangle(img_student, (x1, y1 - text_h - 4), (x1 + text_w, y1), color, -1)
+                    cv2.putText(img_student, label_text, (x1, y1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            else:
+                cv2.putText(img_student, "NO STUDENT PRED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            
+            # 拼接对比图像
+            combined = np.hstack([img_style, img_teacher, img_student])
+            
+            # 添加标题行
+            title_h = 40
+            title_bar = np.zeros((title_h, combined.shape[1], 3), dtype=np.uint8)
+            section_w = combined.shape[1] // 3
+            titles = [
+                f"Style Input",
+                f"Teacher Pseudo Labels ({teacher_count} objs)",
+                f"Student Prediction ({student_count} objs)"
+            ]
+            colors = [(255, 255, 255), (0, 0, 255), (255, 0, 0)]  # 白、红、蓝
+            for idx, (title, color) in enumerate(zip(titles, colors)):
+                cv2.putText(title_bar, title, (idx * section_w + 10, 28), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            combined = np.vstack([title_bar, combined])
+            
+            # 保存图像
+            save_path = student_save_dir / f"compare_epoch{self.epoch}_batch{batch_idx}_img{i}.jpg"
+            cv2.imwrite(str(save_path), combined)
+            
+            # 保存文本对比信息
+            txt_path = student_save_dir / f"compare_epoch{self.epoch}_batch{batch_idx}_img{i}.txt"
+            with open(txt_path, 'w') as f:
+                f.write(f"Epoch: {self.epoch}, Batch: {batch_idx}, Image: {i}\n")
+                f.write(f"conf_thres: {self.conf_thres}, iou_thres: {self.iou_thres}\n\n")
+                f.write(f"Teacher Pseudo Labels ({teacher_count}):\n")
+                if teacher_labels is not None and len(teacher_labels) > 0:
+                    for det in teacher_labels:
+                        x1, y1, x2, y2, conf, cls = det.cpu().numpy()[:6]
+                        f.write(f"  cls:{int(cls)} conf:{conf:.3f} box:[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}]\n")
+                else:
+                    f.write("  None\n")
+                
+                f.write(f"\nStudent Predictions ({student_count}):\n")
+                if student_labels is not None and len(student_labels) > 0:
+                    for det in student_labels:
+                        x1, y1, x2, y2, conf, cls = det.cpu().numpy()[:6]
+                        f.write(f"  cls:{int(cls)} conf:{conf:.3f} box:[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}]\n")
+                else:
+                    f.write("  None\n")
+        
+        LOGGER.info(f"{colorstr('SF-YOLO:')} 已保存学生模型对比图像到 {student_save_dir}")
+
     def _save_debug_visualization(self, imgs, imgs_style, pseudo_labels, batch_idx, prefix="debug"):
         """保存调试可视化图像（原始图像、风格化图像、伪标签）
         
@@ -495,11 +676,6 @@ class SFYOLOTrainer(DetectionTrainer):
                             pseudo_labels, batch_size, img_height, img_width
                         )
                         
-                        # Test mode: 保存伪标签可视化
-                        if self.debug_mode and self.debug_counter % self.debug_interval == 0:
-                            self._save_debug_visualization(imgs, imgs_style, pseudo_labels, i, prefix="pseudo")
-                        self.debug_counter += 1
-                        
                         # 更新批次数据，使用伪标签
                         batch["cls"] = pseudo_cls
                         batch["bboxes"] = pseudo_bboxes
@@ -507,6 +683,13 @@ class SFYOLOTrainer(DetectionTrainer):
                         
                         # 学生模型在风格化图像上前向传播
                         preds_student = self.model(imgs_style)
+                        
+                        # Test mode: 保存伪标签和学生模型输出可视化
+                        if self.debug_mode and self.debug_counter % self.debug_interval == 0:
+                            self._save_debug_visualization(imgs, imgs_style, pseudo_labels, i, prefix="pseudo")
+                            # 同时保存学生模型的输出（与教师伪标签对比）
+                            self._save_student_output(imgs_style, preds_student, pseudo_labels, i)
+                        self.debug_counter += 1
                         
                         # 使用伪标签计算损失
                         if self.args.compile:
