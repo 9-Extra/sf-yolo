@@ -1,12 +1,13 @@
 __pycache__
 
+/.vscode
 /.venv
 /.marscode
 /TargetAugment_train/data
 /TargetAugment_train/models
 /datasets
 /runs
-/source_weights/yolov5l_cityscapes.pt
+/source_weights/
 .ipynb_checkpoints
 
 /TargetAugment_train/models/

@@ -52,7 +52,7 @@ Use the `train_sf-yolo-ultralytics.py` script to perform domain adaptation:
 ```bash
 export UV_PROJECT_ENVIRONMENT=/home/featurize/venv
 
-uv run python train_sf-yolo-ultralytics.py \
+uv run train_sf-yolo-ultralytics.py \
     --weights runs/detect/cityscapes/train/weights/best.pt \
     --data datasets/cityscape/cityscape-foggy-yolo/cityscapes.yaml \
     --epochs 60 \
@@ -70,12 +70,6 @@ uv run python train_sf-yolo-ultralytics.py \
     --iou_thres 0.3 \
     --project runs/sf-yolo \
     --name city2foggy_yolo26
-```
-
-Or use the example script:
-
-```bash
-uv run python example_train_sf_yolo.py
 ```
 
 ## Command Line Arguments

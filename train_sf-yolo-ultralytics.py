@@ -11,17 +11,14 @@ Reference: https://docs.ultralytics.com/zh/guides/custom-trainer/
 import argparse
 import math
 import os
-import random
 import sys
 import time
-import warnings
 from copy import deepcopy
 from pathlib import Path
+import warnings
 
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.optim import lr_scheduler
 
 # Add project root to path
 FILE = Path(__file__).resolve()
@@ -29,12 +26,10 @@ ROOT = FILE.parents[0]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from ultralytics import YOLO
 from ultralytics.models.yolo.detect import DetectionTrainer
-from ultralytics.models.yolo.detect.train import DetectionModel
 from ultralytics.utils import LOGGER, RANK, colorstr, ops, DEFAULT_CFG
 from ultralytics.utils.nms import non_max_suppression
-from ultralytics.utils.torch_utils import ModelEMA, unwrap_model
+from ultralytics.utils.torch_utils import unwrap_model, autocast
 
 # SF-YOLO specific imports
 from TargetAugment.enhance_style import get_style_images
@@ -116,20 +111,9 @@ class SFYOLOTrainer(DetectionTrainer):
         self.save_style_samples = overrides.pop('save_style_samples', False)
         self.random_style = self.style_path == ''
         
-        # Test mode
-        self.test_batches = overrides.pop('test_batches', 0)
-        
         # Store paths for TAM
         self.imgs_paths = []
         
-    def plot_training_samples(self, batch, ni):
-        """Override to skip plotting when using pseudo labels.
-        
-        The default plot_training_samples expects ground truth labels,
-        but SF-YOLO uses pseudo labels which may have different format.
-        """
-        # Skip plotting to avoid format mismatch errors
-        pass
         
     def _setup_train(self):
         """Setup training with dual model architecture."""
@@ -193,9 +177,8 @@ class SFYOLOTrainer(DetectionTrainer):
         Returns:
             Stylized images tensor
         """
-        if self.adain is None:
-            return imgs
-            
+        assert self.adain is not None
+                    
         # Convert to 0-255 range for TAM
         imgs_255 = imgs * 255.0
         
@@ -331,10 +314,6 @@ class SFYOLOTrainer(DetectionTrainer):
             # SSM update at start of epoch (except first)
             if self.SSM_alpha > 0 and epoch > self.start_epoch:
                 self._ssm_update()
-            
-            # Step scheduler
-            with torch.no_grad():
-                self.scheduler.step()
                 
             self._model_train()
             
@@ -377,12 +356,10 @@ class SFYOLOTrainer(DetectionTrainer):
                 
                 # SF-YOLO Training Step
                 try:
-                    from ultralytics.utils.torch_utils import autocast
-                    
                     with autocast(self.amp):
                         # Preprocess batch
-                        batch = self.preprocess_batch(batch)
-                        imgs = batch["img"]  # Original images
+                        imgs = self.preprocess_batch(batch)["img"] # sf-yolo过程只能使用图像，不使用真实标签
+                        batch = dict(img=imgs)
                         batch_size, _, img_height, img_width = imgs.shape
                         
                         # Apply style augmentation
@@ -397,7 +374,7 @@ class SFYOLOTrainer(DetectionTrainer):
                         
                         # Generate pseudo labels
                         pseudo_labels = self._generate_pseudo_labels(preds_teacher)
-                        
+             
                         # Convert pseudo labels to target format
                         pseudo_cls, pseudo_bboxes, pseudo_batch_idx = self._convert_pseudo_labels_to_targets(
                             pseudo_labels, batch_size, img_height, img_width
@@ -426,9 +403,6 @@ class SFYOLOTrainer(DetectionTrainer):
                             else (self.tloss * i + self.loss_items) / (i + 1)
                         )
                     
-                    # Backward
-                    self.scaler.scale(self.loss).backward()
-                    
                 except torch.cuda.OutOfMemoryError:
                     if epoch > self.start_epoch or self._oom_retries >= 3 or RANK != -1:
                         raise
@@ -448,16 +422,19 @@ class SFYOLOTrainer(DetectionTrainer):
                     self.optimizer.zero_grad()
                     break
                 
+                # Backward
+                self.scaler.scale(self.loss).backward()
+                    
                 # Optimize
                 if ni - last_opt_step >= self.accumulate:
+                    last_opt_step = ni
+                    # 优化学生模型
                     self.optimizer_step()
-                    
                     # Update teacher model with EMA
+                    
                     self.model_teacher.train()
                     self.model_teacher.zero_grad()
                     self.optimizer_teacher.step()
-                    
-                    last_opt_step = ni
                     
                     # Timed stopping
                     if self.args.time:
@@ -469,7 +446,7 @@ class SFYOLOTrainer(DetectionTrainer):
                             self.stop = broadcast_list[0]
                         if self.stop:
                             break
-                
+                    
                 # Log
                 if RANK in {-1, 0}:
                     loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
@@ -484,13 +461,6 @@ class SFYOLOTrainer(DetectionTrainer):
                         )
                     )
                     self.run_callbacks("on_batch_end")
-                    if self.args.plots and ni in self.plot_idx:
-                        self.plot_training_samples(batch, ni)
-                
-                # Test mode: stop after N batches
-                if self.test_batches > 0 and i >= self.test_batches - 1:
-                    LOGGER.info(f"{colorstr('SF-YOLO:')} Test mode - stopping after {self.test_batches} batches")
-                    break
                 
                 self.run_callbacks("on_train_batch_end")
                 if self.stop:
@@ -506,6 +476,8 @@ class SFYOLOTrainer(DetectionTrainer):
                 unwrap_model(self.model).criterion.update()
             
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}
+            
+            self.scheduler.step()
             
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
@@ -615,8 +587,7 @@ def parse_args():
     parser.add_argument("--cos_lr", action="store_true", help="Use cosine LR scheduler")
     parser.add_argument("--amp", action="store_true", default=True, help="Use AMP")
     parser.add_argument("--freeze", type=int, nargs="+", default=[0], help="Freeze layers")
-    parser.add_argument("--test-batches", type=int, default=0, help="Test mode: stop after N batches (0 = disable)")
-    
+
     return parser.parse_args()
 
 
@@ -644,12 +615,6 @@ def main():
         LOGGER.warning(f"Style path not found: {args.style_path}, using random style")
         args.style_path = ""
     
-    # Fix project path - Ultralytics uses runs/{task}/{project}/{name} format
-    # Remove 'runs/' prefix if present to avoid double nesting
-    project = args.project
-    if project.startswith('runs/'):
-        project = project[5:]  # Remove 'runs/' prefix
-    
     # Prepare overrides for trainer
     overrides = {
         # SF-YOLO specific
@@ -674,7 +639,7 @@ def main():
         'batch': args.batch,
         'device': args.device,
         'workers': args.workers,
-        'project': project,
+        'project': args.project,
         'name': args.name,
         'exist_ok': args.exist_ok,
         'lr0': args.lr0,
@@ -686,8 +651,7 @@ def main():
         'seed': args.seed,
         'cos_lr': args.cos_lr,
         'amp': args.amp,
-        'freeze': args.freeze,
-        'test_batches': args.test_batches,  # Will be extracted in _extract_sf_yolo_args
+        'freeze': args.freeze
     }
     
     # Create trainer and start training

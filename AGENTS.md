@@ -2,21 +2,7 @@
 
 本项目使用 `uv` 作为 Python 包管理器和运行环境。
 
-## 最佳实践
-
-+ 同步盘，也称为 work 目录，绝对路径为/home/featurize/work，是Featurize为所有用户提供的一种文件持久化的方案。用户可以将自己的代码、模型文件保存至同步盘中，这样即使在归还实例后同步盘中的文件也不会丢失。
-+ 代码和模型文件始终存放在work目录中。
-+ 不要在featurize/work目录中存放数据集
-
 ## 环境配置
-
-### 设置环境变量
-
-在运行任何命令之前，必须设置以下环境变量：
-
-```bash
-export UV_PROJECT_ENVIRONMENT=/home/featurize/venv
-```
 
 ## 使用 uv 运行脚本
 
@@ -71,7 +57,6 @@ uv run python -c "import torch; print(torch.__version__)"
 ## 重要提示
 
 - **不要**直接使用系统 Python 或 pip 运行脚本或安装包
-- 始终确保 `UV_PROJECT_ENVIRONMENT` 环境变量已设置
 - 项目使用清华镜像源加速依赖下载，并在需要时从 PyTorch 官方源安装 CUDA 版本的 torch/torchvision
 
 ## 项目依赖说明
@@ -113,7 +98,6 @@ results = model.train(
 
 运行训练：
 ```bash
-export UV_PROJECT_ENVIRONMENT=/home/featurize/venv
 uv run python train_yolo26.py
 ```
 
