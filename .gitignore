@@ -12,3 +12,4 @@ __pycache__
 
 /TargetAugment_train/models/
 /yolo*.pt
+/check

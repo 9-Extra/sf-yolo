@@ -83,7 +83,7 @@ model = YOLO("yolo26n.pt")
 
 # 训练配置
 results = model.train(
-    data="datasets/cityscape-yolo/cityscapes.yaml",
+    data="path/to/cityscapes.yaml",
     epochs=100,
     imgsz=960,
     batch=16,
@@ -117,11 +117,11 @@ uv run python train_yolo26.py
 from ultralytics import YOLO
 
 # 加载训练好的模型
-model = YOLO("runs/train_yolo26/cityscapes_baseline/weights/best.pt")
+model = YOLO("source_weights/yolov26l_cityscapes.pt")
 
 # 在源域（Cityscapes）验证
 metrics_source = model.val(
-    data="datasets/cityscape-yolo/cityscapes.yaml",
+    data="path/to/cityscapes.yaml",
     imgsz=960,
     batch=16,
     verbose=False
@@ -130,7 +130,7 @@ print(f"Source - mAP@50: {metrics_source.box.map50:.4f}")
 
 # 在目标域（Foggy Cityscapes）验证
 metrics_target = model.val(
-    data="datasets/cityscape-foggy-yolo/cityscapes.yaml",
+    data="path/to/cityscapes_foggy.yaml",
     imgsz=960,
     batch=16,
     verbose=False
@@ -151,7 +151,7 @@ uv run python validate_yolo26.py
 ```bash
 uv run val.py \
     --weights source_weights/yolov5l_cityscapes.pt \
-    --data datasets/cityscape-yolo/cityscapes.yaml \
+    --data path/to/cityscapes.yaml \
     --imgsz 960 \
     --batch-size 16 \
     --task val
@@ -161,7 +161,7 @@ uv run val.py \
 ```bash
 uv run val.py \
     --weights source_weights/yolov5l_cityscapes.pt \
-    --data datasets/cityscape-foggy-yolo/cityscapes.yaml \
+    --data path/to/cityscapes_foggy.yaml \
     --imgsz 960 \
     --batch-size 16 \
     --task val

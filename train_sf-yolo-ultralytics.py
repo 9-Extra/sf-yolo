@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-SF-YOLO Training Script for YOLOv26 (Ultralytics)
+SF-YOLO 训练脚本（基于 YOLOv26 / Ultralytics）
 
-This script implements the Source-Free Domain Adaptation method SF-YOLO 
-for YOLOv26 models using Ultralytics' custom trainer API.
+本脚本实现了 SF-YOLO（Source-Free YOLO）无源域自适应方法，
+用于 YOLOv26 模型的域自适应训练。使用 Ultralytics 的自定义训练器 API。
 
-Reference: https://docs.ultralytics.com/zh/guides/custom-trainer/
+参考文档: https://docs.ultralytics.com/zh/guides/custom-trainer/
 """
 
 import argparse
@@ -16,11 +16,13 @@ import time
 from copy import deepcopy
 from pathlib import Path
 import warnings
+import cv2
 
 import numpy as np
 import torch
+import torchvision
 
-# Add project root to path
+# 添加项目根目录到 Python 路径
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]
 if str(ROOT) not in sys.path:
@@ -31,77 +33,88 @@ from ultralytics.utils import LOGGER, RANK, colorstr, ops, DEFAULT_CFG
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.torch_utils import unwrap_model, autocast
 
-# SF-YOLO specific imports
+# SF-YOLO 相关模块导入
 from TargetAugment.enhance_style import get_style_images
 from TargetAugment.enhance_vgg16 import enhance_vgg16
 
 
 class WeightEMA:
-    """Unbiased Mean Teacher EMA optimizer.
+    """权重指数移动平均（EMA）优化器
     
-    Reference: github.com/kinredon/umt
+    使用无偏置的 Mean Teacher EMA 更新策略，
+    教师模型参数通过学生模型参数的指数移动平均来更新。
+    
+    参考: github.com/kinredon/umt
     """
     
     def __init__(self, teacher_params, student_params, alpha=0.999):
+        """初始化 EMA 优化器
+        
+        Args:
+            teacher_params: 教师模型参数迭代器
+            student_params: 学生模型参数迭代器
+            alpha: EMA 衰减系数，越接近 1 表示历史权重占比越高
+        """
         self.teacher_params = list(teacher_params)
         self.student_params = list(student_params)
         self.alpha = alpha
         
     def step(self):
-        """Apply EMA update from student to teacher."""
+        """执行 EMA 更新，将学生模型的参数更新到教师模型"""
         for teacher_param, student_param in zip(self.teacher_params, self.student_params):
             if teacher_param.requires_grad:
+                # EMA 公式: θ_teacher = α * θ_teacher + (1-α) * θ_student
                 teacher_param.data.mul_(self.alpha).add_(student_param.data, alpha=1 - self.alpha)
 
 
 class SFYOLOTrainer(DetectionTrainer):
-    """Custom trainer for SF-YOLO (Source-Free Domain Adaptation).
+    """SF-YOLO 自定义训练器（无源域自适应）
     
-    This trainer implements:
-    1. Dual model architecture (Student + Teacher with EMA)
-    2. Target Augmentation Module (TAM) for style transfer
-    3. Pseudo-label generation by Teacher model
-    4. Student training on stylized images with pseudo-labels
-    5. Optional SSM (Stable Student Momentum)
+    本训练器实现了 SF-YOLO 的核心功能：
+    1. 双模型架构（学生模型 + 教师模型，使用 EMA 机制）
+    2. 目标域增强模块（TAM）进行风格迁移
+    3. 教师模型生成伪标签
+    4. 学生模型在风格化图像上训练，使用伪标签监督
+    5. 可选的 SSM（稳定学生动量）机制
     
     Attributes:
-        model_teacher: Teacher model for pseudo-label generation
-        optimizer_teacher: EMA optimizer for teacher model
-        adain: Target Augmentation Module (TAM)
-        teacher_alpha: EMA decay rate for teacher
-        conf_thres: Confidence threshold for pseudo-labels
-        iou_thres: IoU threshold for NMS
-        max_det: Maximum detections per image
-        SSM_alpha: SSM momentum (0 to disable)
-        style_add_alpha: Style transfer intensity
+        model_teacher: 教师模型，用于生成伪标签
+        optimizer_teacher: 教师模型的 EMA 优化器
+        adain: 目标域增强模块（TAM）
+        teacher_alpha: 教师模型 EMA 衰减率
+        conf_thres: 伪标签置信度阈值
+        iou_thres: NMS 的 IoU 阈值
+        max_det: 每张图像最大检测数量
+        SSM_alpha: SSM 动量系数（0 表示禁用）
+        style_add_alpha: 风格迁移强度
     """
     
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
-        """Initialize SF-YOLO trainer.
+        """初始化 SF-YOLO 训练器
         
         Args:
-            cfg: Configuration
-            overrides: Configuration overrides
-            _callbacks: Callbacks
+            cfg: 基础配置对象
+            overrides: 配置覆盖参数
+            _callbacks: 回调函数
         """
-        # Extract SF-YOLO specific args before parent init
+        # 在父类初始化前提取 SF-YOLO 特有参数
         self._extract_sf_yolo_args(overrides or {})
         
         super().__init__(cfg, overrides, _callbacks)
         
-        # Initialize TAM module
+        # 初始化 TAM 模块（后续在 setup 中完成）
         self.adain = None
         
     def _extract_sf_yolo_args(self, overrides):
-        """Extract SF-YOLO specific arguments from overrides."""
-        # Teacher EMA parameters
+        """从 overrides 中提取 SF-YOLO 特有参数"""
+        # 教师模型 EMA 参数
         self.teacher_alpha = overrides.pop('teacher_alpha', 0.999)
         self.conf_thres = overrides.pop('conf_thres', 0.4)
         self.iou_thres = overrides.pop('iou_thres', 0.3)
         self.max_det = overrides.pop('max_det', 20)
         self.SSM_alpha = overrides.pop('SSM_alpha', 0.0)
         
-        # TAM parameters
+        # TAM 模块参数
         self.decoder_path = overrides.pop('decoder_path', None)
         self.encoder_path = overrides.pop('encoder_path', None)
         self.fc1_path = overrides.pop('fc1', None)
@@ -111,40 +124,49 @@ class SFYOLOTrainer(DetectionTrainer):
         self.save_style_samples = overrides.pop('save_style_samples', False)
         self.random_style = self.style_path == ''
         
-        # Store paths for TAM
+        # 存储图像路径供 TAM 使用
         self.imgs_paths = []
+        
+        # Test mode: 伪标签调试相关
+        self.debug_mode = overrides.pop('debug_mode', False)
+        self.debug_interval = overrides.pop('debug_interval', 50)  # 每N个batch保存一次
+        self.debug_counter = 0
+        self.debug_save_dir = Path(overrides.pop('debug_save_dir', './check'))
+        if self.debug_mode:
+            self.debug_save_dir.mkdir(parents=True, exist_ok=True)
+            LOGGER.info(f"{colorstr('SF-YOLO:')} Test mode 已启用，伪标签将保存到 {self.debug_save_dir}")
         
         
     def _setup_train(self):
-        """Setup training with dual model architecture."""
-        # Call parent setup first
+        """设置训练环境，初始化双模型架构"""
+        # 先调用父类的训练设置
         super()._setup_train()
         
-        # Initialize Target Augmentation Module
+        # 初始化目标域增强模块
         self._init_tam()
         
-        # Create teacher model
-        LOGGER.info(f"{colorstr('SF-YOLO:')} Creating teacher model...")
+        # 创建教师模型（深拷贝学生模型）
+        LOGGER.info(f"{colorstr('SF-YOLO:')} 正在创建教师模型...")
         self.model_teacher = deepcopy(self.model).eval()
         
-        # Freeze teacher model parameters
+        # 冻结教师模型参数（不参与梯度更新，只通过 EMA 更新）
         for param in self.model_teacher.parameters():
             param.requires_grad = False
             
-        # Create teacher EMA optimizer
+        # 创建教师模型的 EMA 优化器
         teacher_params = [p for p in self.model_teacher.parameters() if p.requires_grad]
         student_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer_teacher = WeightEMA(teacher_params, student_params, alpha=self.teacher_alpha)
         
-        LOGGER.info(f"{colorstr('SF-YOLO:')} Teacher model initialized with alpha={self.teacher_alpha}")
+        LOGGER.info(f"{colorstr('SF-YOLO:')} 教师模型初始化完成，EMA alpha={self.teacher_alpha}")
         LOGGER.info(f"{colorstr('SF-YOLO:')} SSM_alpha={self.SSM_alpha}, conf_thres={self.conf_thres}, iou_thres={self.iou_thres}")
         
     def _init_tam(self):
-        """Initialize Target Augmentation Module."""
+        """初始化目标域增强模块（TAM）"""
         if self.decoder_path and self.encoder_path and self.fc1_path and self.fc2_path:
-            LOGGER.info(f"{colorstr('SF-YOLO:')} Initializing Target Augmentation Module...")
+            LOGGER.info(f"{colorstr('SF-YOLO:')} 正在初始化目标域增强模块（TAM）...")
             
-            # Create args object for TAM
+            # 创建 TAM 参数对象
             class TAMArgs:
                 pass
             
@@ -164,39 +186,39 @@ class SFYOLOTrainer(DetectionTrainer):
             
             self.tam_args = tam_args
             self.adain = enhance_vgg16(tam_args)
-            LOGGER.info(f"{colorstr('SF-YOLO:')} TAM initialized with style_add_alpha={self.style_add_alpha}")
+            LOGGER.info(f"{colorstr('SF-YOLO:')} TAM 初始化完成，风格迁移强度 style_add_alpha={self.style_add_alpha}")
         else:
-            LOGGER.warning(f"{colorstr('SF-YOLO:')} TAM weights not provided, style augmentation disabled")
+            LOGGER.warning(f"{colorstr('SF-YOLO:')} 未提供 TAM 权重路径，风格增强功能已禁用")
             
     def _apply_style_augmentation(self, imgs):
-        """Apply style augmentation to images using TAM.
+        """使用 TAM 对图像进行风格增强
         
         Args:
-            imgs: Tensor of images (B, C, H, W) in range [0, 1]
+            imgs: 图像张量，形状为 (B, C, H, W)，像素值范围 [0, 1]
             
         Returns:
-            Stylized images tensor
+            风格化后的图像张量
         """
         assert self.adain is not None
                     
-        # Convert to 0-255 range for TAM
+        # 将像素值从 [0, 1] 转换到 [0, 255] 范围（TAM 需要）
         imgs_255 = imgs * 255.0
         
-        # Apply style transfer
+        # 应用风格迁移
         styled_imgs = get_style_images(imgs_255, self.tam_args, self.adain) / 255.0
         
         return styled_imgs
     
     def _generate_pseudo_labels(self, preds):
-        """Generate pseudo labels from teacher predictions.
+        """从教师模型预测中生成伪标签
         
         Args:
-            preds: Raw predictions from teacher model
+            preds: 教师模型的原始预测输出
             
         Returns:
-            List of pseudo label tensors per image
+            每张图像的伪标签列表
         """
-        # Apply NMS to get final detections
+        # 应用非极大值抑制（NMS）获取最终检测结果
         pred_nms = non_max_suppression(
             preds,
             conf_thres=self.conf_thres,
@@ -208,17 +230,110 @@ class SFYOLOTrainer(DetectionTrainer):
         
         return pred_nms
     
-    def _convert_pseudo_labels_to_targets(self, pseudo_labels, batch_size, img_height, img_width):
-        """Convert pseudo labels to target format for loss computation.
+    def _save_debug_visualization(self, imgs, imgs_style, pseudo_labels, batch_idx, prefix="debug"):
+        """保存调试可视化图像（原始图像、风格化图像、伪标签）
         
         Args:
-            pseudo_labels: List of pseudo label tensors per image
-            batch_size: Batch size
-            img_height: Image height
-            img_width: Image width
+            imgs: 原始图像张量 (B, C, H, W)，范围 [0, 1]
+            imgs_style: 风格化图像张量 (B, C, H, W)，范围 [0, 1]
+            pseudo_labels: 伪标签列表
+            batch_idx: 当前batch索引
+            prefix: 文件名前缀
+        """
+        if not self.debug_mode:
+            return
+        
+        # 只保存前2张图像
+        num_save = min(2, imgs.shape[0])
+        
+        for i in range(num_save):
+            # 转换图像为numpy格式 (H, W, C)，范围 [0, 255]
+            img_orig = imgs[i].cpu().permute(1, 2, 0).numpy() * 255
+            img_orig = img_orig.astype(np.uint8).copy()
+            img_orig = cv2.cvtColor(img_orig, cv2.COLOR_RGB2BGR)
+            
+            img_style = imgs_style[i].cpu().permute(1, 2, 0).numpy() * 255
+            img_style = img_style.astype(np.uint8).copy()
+            img_style = cv2.cvtColor(img_style, cv2.COLOR_RGB2BGR)
+            
+            h, w = img_orig.shape[:2]
+            
+            # 绘制伪标签到原始图像
+            img_with_labels = img_orig.copy()
+            labels = pseudo_labels[i]
+            
+            if labels is not None and len(labels) > 0:
+                for det in labels:
+                    x1, y1, x2, y2, conf, cls = det.cpu().numpy()[:6]
+                    # 确保坐标在图像范围内
+                    x1, y1, x2, y2 = max(0, int(x1)), max(0, int(y1)), min(w, int(x2)), min(h, int(y2))
+                    
+                    # 绘制边界框
+                    color = (0, 255, 0)  # 绿色
+                    thickness = 2
+                    cv2.rectangle(img_with_labels, (x1, y1), (x2, y2), color, thickness)
+                    
+                    # 绘制标签文本
+                    label_text = f"cls:{int(cls)} conf:{conf:.2f}"
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.5
+                    text_color = (0, 255, 0)
+                    text_thickness = 1
+                    
+                    # 获取文本尺寸
+                    (text_w, text_h), _ = cv2.getTextSize(label_text, font, font_scale, text_thickness)
+                    
+                    # 绘制文本背景
+                    cv2.rectangle(img_with_labels, (x1, y1 - text_h - 4), (x1 + text_w, y1), color, -1)
+                    # 绘制文本
+                    cv2.putText(img_with_labels, label_text, (x1, y1 - 2), font, font_scale, (0, 0, 0), text_thickness)
+            else:
+                # 没有检测到目标，在图像上标注
+                cv2.putText(img_with_labels, "NO DETECTIONS", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            
+            # 拼接原始图像、风格化图像和带伪标签的图像
+            combined = np.hstack([img_orig, img_style, img_with_labels])
+            
+            # 添加标题行
+            title_h = 30
+            title_bar = np.zeros((title_h, combined.shape[1], 3), dtype=np.uint8)
+            titles = ["Original", "Style Augmented", f"Pseudo Labels ({len(labels) if labels is not None else 0} objs)"]
+            section_w = combined.shape[1] // 3
+            for idx, title in enumerate(titles):
+                cv2.putText(title_bar, title, (idx * section_w + 10, 22), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            combined = np.vstack([title_bar, combined])
+            
+            # 保存图像
+            save_path = self.debug_save_dir / f"{prefix}_epoch{self.epoch}_batch{batch_idx}_img{i}.jpg"
+            cv2.imwrite(str(save_path), combined)
+            
+            # 同时保存伪标签的文本信息
+            txt_path = self.debug_save_dir / f"{prefix}_epoch{self.epoch}_batch{batch_idx}_img{i}.txt"
+            with open(txt_path, 'w') as f:
+                f.write(f"Epoch: {self.epoch}, Batch: {batch_idx}, Image: {i}\n")
+                f.write(f"conf_thres: {self.conf_thres}, iou_thres: {self.iou_thres}\n")
+                f.write(f"Num detections: {len(labels) if labels is not None else 0}\n\n")
+                if labels is not None and len(labels) > 0:
+                    f.write("Format: [x1, y1, x2, y2, conf, cls]\n")
+                    for det in labels:
+                        x1, y1, x2, y2, conf, cls = det.cpu().numpy()[:6]
+                        f.write(f"{x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f} {conf:.4f} {int(cls)}\n")
+        
+        LOGGER.info(f"{colorstr('SF-YOLO:')} 已保存调试图像到 {self.debug_save_dir}")
+    
+    def _convert_pseudo_labels_to_targets(self, pseudo_labels, batch_size, img_height, img_width):
+        """将伪标签转换为损失计算所需的格式
+        
+        Args:
+            pseudo_labels: 每张图像的伪标签列表
+            batch_size: 批次大小
+            img_height: 图像高度
+            img_width: 图像宽度
             
         Returns:
-            Tuple of (cls_tensor, bboxes_tensor, batch_idx_tensor)
+            包含类别、边界框和批次索引的元组 (cls_tensor, bboxes_tensor, batch_idx_tensor)
         """
         device = self.device
         cls_list = []
@@ -227,12 +342,12 @@ class SFYOLOTrainer(DetectionTrainer):
         
         for image_id in range(batch_size):
             if pseudo_labels[image_id].shape[0] > 0:
-                # pseudo_labels format: [x1, y1, x2, y2, conf, cls, ...]
-                # Extract cls and boxes
+                # pseudo_labels 格式: [x1, y1, x2, y2, conf, cls, ...]
+                # 提取类别和边界框
                 cls_data = pseudo_labels[image_id][:, 5:6]  # (N, 1)
                 boxes_xyxy = pseudo_labels[image_id][:, :4]  # (N, 4)
                 
-                # Convert xyxy to xywh (normalized)
+                # 将 xyxy 格式转换为 xywh 格式（归一化）
                 boxes_xywh = ops.xyxy2xywhn(boxes_xyxy, w=img_width, h=img_height)
                 
                 cls_list.append(cls_data)
@@ -245,16 +360,16 @@ class SFYOLOTrainer(DetectionTrainer):
             batch_idx_tensor = torch.cat(batch_idx_list, dim=0).unsqueeze(1)
             return cls_tensor, bboxes_tensor, batch_idx_tensor
         else:
-            # Return dummy label if no detections
+            # 如果没有检测到目标，返回虚拟标签（避免训练崩溃）
             cls_tensor = torch.tensor([[0]], device=device, dtype=torch.float32)
             bboxes_tensor = torch.tensor([[0.5, 0.7, 0.3, 0.3]], device=device, dtype=torch.float32)
             batch_idx_tensor = torch.tensor([[0]], device=device, dtype=torch.float32)
             return cls_tensor, bboxes_tensor, batch_idx_tensor
     
     def _ssm_update(self):
-        """Apply Stable Student Momentum update.
+        """应用稳定学生动量（SSM）更新
         
-        Transfers teacher weights to student at the start of epoch.
+        在每个 epoch 开始时，将教师模型的权重按一定比例转移到学生模型
         """
         if self.SSM_alpha > 0:
             student_state_dict = self.model.state_dict()
@@ -267,16 +382,16 @@ class SFYOLOTrainer(DetectionTrainer):
                         self.SSM_alpha * teacher_state_dict[name].data
                     )
             
-            LOGGER.info(f"{colorstr('SF-YOLO:')} SSM update applied at epoch {self.epoch}, alpha={self.SSM_alpha}")
+            LOGGER.info(f"{colorstr('SF-YOLO:')} 已在第 {self.epoch} 轮应用 SSM 更新，alpha={self.SSM_alpha}")
     
     def _do_train(self):
-        """Custom training loop for SF-YOLO.
+        """SF-YOLO 自定义训练循环
         
-        Overrides parent _do_train to implement:
-        1. Style augmentation
-        2. Teacher pseudo-label generation
-        3. Student training on stylized images
-        4. Teacher EMA update
+        重写父类训练循环以实现：
+        1. 风格增强
+        2. 教师模型生成伪标签
+        3. 学生模型在风格化图像上训练
+        4. 教师模型 EMA 更新
         """
         if self.world_size > 1:
             self._setup_ddp()
@@ -292,13 +407,13 @@ class SFYOLOTrainer(DetectionTrainer):
         self.run_callbacks("on_train_start")
         
         LOGGER.info(
-            f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n"
-            f"Using {self.train_loader.num_workers * (self.world_size or 1)} dataloader workers\n"
-            f"Logging results to {colorstr('bold', self.save_dir)}\n"
-            f"Starting SF-YOLO training for {self.epochs} epochs..."
+            f"图像尺寸 {self.args.imgsz} 训练, {self.args.imgsz} 验证\n"
+            f"使用 {self.train_loader.num_workers * (self.world_size or 1)} 个数据加载工作进程\n"
+            f"日志保存到 {colorstr('bold', self.save_dir)}\n"
+            f"开始 SF-YOLO 训练，共 {self.epochs} 轮..."
         )
         
-        # Close mosaic if specified
+        # 关闭 mosaic 增强（如果指定）
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
@@ -311,7 +426,7 @@ class SFYOLOTrainer(DetectionTrainer):
             self.epoch = epoch
             self.run_callbacks("on_train_epoch_start")
             
-            # SSM update at start of epoch (except first)
+            # 每轮开始时应用 SSM 更新（第一轮除外）
             if self.SSM_alpha > 0 and epoch > self.start_epoch:
                 self._ssm_update()
                 
@@ -322,7 +437,7 @@ class SFYOLOTrainer(DetectionTrainer):
                 
             pbar = enumerate(self.train_loader)
             
-            # Update dataloader attributes
+            # 更新数据加载器属性
             if epoch == (self.epochs - self.args.close_mosaic):
                 self._close_dataloader_mosaic()
                 self.train_loader.reset()
@@ -337,7 +452,7 @@ class SFYOLOTrainer(DetectionTrainer):
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 
-                # Warmup
+                # 预热阶段学习率调整
                 ni = i + nb * epoch
                 if ni <= nw:
                     xi = [0, nw]
@@ -354,41 +469,46 @@ class SFYOLOTrainer(DetectionTrainer):
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
                 
-                # SF-YOLO Training Step
+                # SF-YOLO 训练步骤
                 try:
                     with autocast(self.amp):
-                        # Preprocess batch
-                        imgs = self.preprocess_batch(batch)["img"] # sf-yolo过程只能使用图像，不使用真实标签
+                        # 预处理批次数据
+                        imgs = self.preprocess_batch(batch)["img"]  # SF-YOLO 只使用图像，不使用真实标签
                         batch = dict(img=imgs)
                         batch_size, _, img_height, img_width = imgs.shape
                         
-                        # Apply style augmentation
+                        # 应用风格增强
                         imgs_style = self._apply_style_augmentation(imgs)
                         
-                        # Teacher forward on original images (for pseudo labels)
+                        # 教师模型在前向传播（用于生成伪标签）
                         self.model_teacher.eval()
                         with torch.no_grad():
                             preds_teacher = self.model_teacher(imgs)
                             if isinstance(preds_teacher, (list, tuple)):
                                 preds_teacher = preds_teacher[0]
                         
-                        # Generate pseudo labels
+                        # 生成伪标签
                         pseudo_labels = self._generate_pseudo_labels(preds_teacher)
              
-                        # Convert pseudo labels to target format
+                        # 将伪标签转换为训练目标格式
                         pseudo_cls, pseudo_bboxes, pseudo_batch_idx = self._convert_pseudo_labels_to_targets(
                             pseudo_labels, batch_size, img_height, img_width
                         )
                         
-                        # Update batch with pseudo targets
+                        # Test mode: 保存伪标签可视化
+                        if self.debug_mode and self.debug_counter % self.debug_interval == 0:
+                            self._save_debug_visualization(imgs, imgs_style, pseudo_labels, i, prefix="pseudo")
+                        self.debug_counter += 1
+                        
+                        # 更新批次数据，使用伪标签
                         batch["cls"] = pseudo_cls
                         batch["bboxes"] = pseudo_bboxes
                         batch["batch_idx"] = pseudo_batch_idx
                         
-                        # Student forward on stylized images
+                        # 学生模型在风格化图像上前向传播
                         preds_student = self.model(imgs_style)
                         
-                        # Compute loss with pseudo labels
+                        # 使用伪标签计算损失
                         if self.args.compile:
                             loss, self.loss_items = unwrap_model(self.model).loss(batch, preds_student)
                         else:
@@ -410,8 +530,8 @@ class SFYOLOTrainer(DetectionTrainer):
                     old_batch = self.batch_size
                     self.args.batch = self.batch_size = max(self.batch_size // 2, 1)
                     LOGGER.warning(
-                        f"CUDA out of memory with batch={old_batch}. "
-                        f"Reducing to batch={self.batch_size} and retrying ({self._oom_retries}/3)."
+                        f"CUDA 内存不足，批次大小={old_batch}。"
+                        f"减少到批次大小={self.batch_size} 并重试 ({self._oom_retries}/3)。"
                     )
                     self._clear_memory()
                     self._build_train_pipeline()
@@ -422,21 +542,21 @@ class SFYOLOTrainer(DetectionTrainer):
                     self.optimizer.zero_grad()
                     break
                 
-                # Backward
+                # 反向传播
                 self.scaler.scale(self.loss).backward()
                     
-                # Optimize
+                # 优化步骤
                 if ni - last_opt_step >= self.accumulate:
                     last_opt_step = ni
                     # 优化学生模型
                     self.optimizer_step()
-                    # Update teacher model with EMA
+                    # 使用 EMA 更新教师模型
                     
                     self.model_teacher.train()
                     self.model_teacher.zero_grad()
                     self.optimizer_teacher.step()
                     
-                    # Timed stopping
+                    # 定时停止检查
                     if self.args.time:
                         self.stop = (time.time() - self.train_time_start) > (self.args.time * 3600)
                         if RANK != -1:
@@ -447,7 +567,7 @@ class SFYOLOTrainer(DetectionTrainer):
                         if self.stop:
                             break
                     
-                # Log
+                # 日志记录
                 if RANK in {-1, 0}:
                     loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
                     pbar.set_description(
@@ -466,7 +586,7 @@ class SFYOLOTrainer(DetectionTrainer):
                 if self.stop:
                     break
             else:
-                # Loop completed without break
+                # 循环正常完成（未触发 break）
                 self._oom_retries = 0
             
             if self._oom_retries and not self.stop:
@@ -483,13 +603,13 @@ class SFYOLOTrainer(DetectionTrainer):
             if RANK in {-1, 0}:
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
             
-            # Validation
+            # 验证
             final_epoch = epoch + 1 >= self.epochs
             if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                 self._clear_memory(threshold=0.5)
                 self.metrics, self.fitness = self.validate()
             
-            # NaN recovery
+            # NaN 恢复
             if self._handle_nan_recovery(epoch):
                 continue
             
@@ -500,12 +620,12 @@ class SFYOLOTrainer(DetectionTrainer):
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
                 
-                # Save model
+                # 保存模型
                 if self.args.save or final_epoch:
                     self.save_model()
                     self.run_callbacks("on_model_save")
             
-            # Scheduler
+            # 学习率调度
             t = time.time()
             self.epoch_time = t - self.epoch_time_start
             self.epoch_time_start = t
@@ -519,7 +639,7 @@ class SFYOLOTrainer(DetectionTrainer):
             self.run_callbacks("on_fit_epoch_end")
             self._clear_memory(0.5)
             
-            # Early Stopping
+            # 早停
             if RANK != -1:
                 from torch import distributed as dist
                 broadcast_list = [self.stop if RANK == 0 else None]
@@ -530,9 +650,9 @@ class SFYOLOTrainer(DetectionTrainer):
                 break
             epoch += 1
         
-        # Training complete
+        # 训练完成
         seconds = time.time() - self.train_time_start
-        LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
+        LOGGER.info(f"\n训练完成，共 {epoch - self.start_epoch + 1} 轮，耗时 {seconds / 3600:.3f} 小时。")
         self.final_eval()
         if RANK in {-1, 0}:
             if self.args.plots:
@@ -545,79 +665,81 @@ class SFYOLOTrainer(DetectionTrainer):
 
 
 def parse_args():
-    """Parse command line arguments for SF-YOLO training."""
-    parser = argparse.ArgumentParser(description="SF-YOLO Training for YOLOv26")
+    """解析 SF-YOLO 训练的命令行参数"""
+    parser = argparse.ArgumentParser(description="SF-YOLO 训练脚本（YOLOv26）")
     
-    # Model and data arguments
-    parser.add_argument("--weights", type=str, default="yolo26n.pt", help="Initial weights path")
-    parser.add_argument("--data", type=str, required=True, help="Dataset YAML path")
-    parser.add_argument("--epochs", type=int, default=60, help="Total training epochs")
-    parser.add_argument("--imgsz", type=int, default=960, help="Image size")
-    parser.add_argument("--batch", type=int, default=16, help="Batch size")
-    parser.add_argument("--device", type=str, default="0", help="Device (cuda or cpu)")
-    parser.add_argument("--workers", type=int, default=8, help="Number of dataloader workers")
-    parser.add_argument("--project", type=str, default="runs/sf-yolo", help="Project directory")
-    parser.add_argument("--name", type=str, default="exp", help="Experiment name")
-    parser.add_argument("--exist-ok", action="store_true", help="Overwrite existing experiment")
+    # 模型和数据参数
+    parser.add_argument("--weights", type=str, default="yolo26n.pt", help="初始权重路径")
+    parser.add_argument("--data", type=str, required=True, help="数据集 YAML 文件路径")
+    parser.add_argument("--epochs", type=int, default=60, help="训练总轮数")
+    parser.add_argument("--imgsz", type=int, default=960, help="图像尺寸")
+    parser.add_argument("--batch", type=int, default=16, help="批次大小")
+    parser.add_argument("--device", type=str, default="0", help="计算设备（cuda 或 cpu）")
+    parser.add_argument("--workers", type=int, default=8, help="数据加载工作进程数")
+    parser.add_argument("--project", type=str, default="runs/sf-yolo", help="项目目录")
+    parser.add_argument("--name", type=str, default="exp", help="实验名称")
+    parser.add_argument("--exist-ok", action="store_true", help="覆盖已存在的实验目录")
     
-    # SF-YOLO specific arguments
-    parser.add_argument("--teacher_alpha", type=float, default=0.999, help="Teacher EMA alpha")
-    parser.add_argument("--conf_thres", type=float, default=0.4, help="Confidence threshold for pseudo labels")
-    parser.add_argument("--iou_thres", type=float, default=0.3, help="IoU threshold for NMS")
-    parser.add_argument("--max_det", type=int, default=20, help="Maximum detections per image")
-    parser.add_argument("--SSM_alpha", type=float, default=0.0, help="SSM momentum (0 to disable)")
+    # SF-YOLO 特有参数
+    parser.add_argument("--teacher_alpha", type=float, default=0.999, help="教师模型 EMA alpha")
+    parser.add_argument("--conf_thres", type=float, default=0.4, help="伪标签置信度阈值")
+    parser.add_argument("--iou_thres", type=float, default=0.3, help="NMS IoU 阈值")
+    parser.add_argument("--max_det", type=int, default=20, help="每张图像最大检测数")
+    parser.add_argument("--SSM_alpha", type=float, default=0.0, help="SSM 动量系数（0 表示禁用）")
     
-    # TAM arguments
-    parser.add_argument("--decoder_path", type=str, required=True, help="Decoder path")
-    parser.add_argument("--encoder_path", type=str, required=True, help="Encoder (VGG) path")
-    parser.add_argument("--fc1", type=str, required=True, help="FC1 path")
-    parser.add_argument("--fc2", type=str, required=True, help="FC2 path")
-    parser.add_argument("--style_path", type=str, default="", help="Style image path (empty for random)")
-    parser.add_argument("--style_add_alpha", type=float, default=1.0, help="Style transfer intensity")
-    parser.add_argument("--save_style_samples", action="store_true", help="Save style sample images")
+    # TAM 参数
+    parser.add_argument("--decoder_path", type=str, required=True, help="解码器权重路径")
+    parser.add_argument("--encoder_path", type=str, required=True, help="编码器（VGG）权重路径")
+    parser.add_argument("--fc1", type=str, required=True, help="FC1 权重路径")
+    parser.add_argument("--fc2", type=str, required=True, help="FC2 权重路径")
+    parser.add_argument("--style_path", type=str, default="", help="风格图像路径（空表示使用随机风格）")
+    parser.add_argument("--style_add_alpha", type=float, default=1.0, help="风格迁移强度")
+    parser.add_argument("--save_style_samples", action="store_true", help="保存风格样本图像")
     
-    # Training arguments
-    parser.add_argument("--lr0", type=float, default=0.01, help="Initial learning rate")
-    parser.add_argument("--lrf", type=float, default=0.01, help="Final learning rate factor")
-    parser.add_argument("--momentum", type=float, default=0.937, help="SGD momentum")
-    parser.add_argument("--weight_decay", type=float, default=0.0005, help="Weight decay")
-    parser.add_argument("--warmup_epochs", type=float, default=3.0, help="Warmup epochs")
-    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed")
-    parser.add_argument("--cos_lr", action="store_true", help="Use cosine LR scheduler")
-    parser.add_argument("--amp", action="store_true", default=True, help="Use AMP")
-    parser.add_argument("--freeze", type=int, nargs="+", default=[0], help="Freeze layers")
+    # Test mode 参数
+    parser.add_argument("--debug_mode", action="store_true", help="启用调试模式，保存伪标签可视化")
+    parser.add_argument("--debug_interval", type=int, default=50, help="每隔N个batch保存一次调试图像")
+    parser.add_argument("--debug_save_dir", type=str, default="./check", help="调试图像保存目录")
+    
+    # 训练参数
+    parser.add_argument("--lr0", type=float, default=0.01, help="初始学习率")
+    parser.add_argument("--lrf", type=float, default=0.01, help="最终学习率系数")
+    parser.add_argument("--momentum", type=float, default=0.937, help="SGD 动量")
+    parser.add_argument("--weight_decay", type=float, default=0.0005, help="权重衰减")
+    parser.add_argument("--warmup_epochs", type=float, default=3.0, help="预热轮数")
+    parser.add_argument("--patience", type=int, default=20, help="早停耐心值")
+    parser.add_argument("--seed", type=int, default=0, help="随机种子")
+    parser.add_argument("--cos_lr", action="store_true", help="使用余弦学习率调度")
+    parser.add_argument("--amp", action="store_true", default=True, help="使用自动混合精度")
+    parser.add_argument("--freeze", type=int, nargs="+", default=[0], help="冻结层索引")
 
     return parser.parse_args()
 
 
 def main():
-    """Main function for SF-YOLO training."""
+    """SF-YOLO 训练主函数"""
     args = parse_args()
     
-    # Set environment variable for uv
-    os.environ.setdefault("UV_PROJECT_ENVIRONMENT", "/home/featurize/venv")
-    
-    # Validate TAM paths
+    # 验证 TAM 权重路径
     if args.decoder_path and not os.path.exists(args.decoder_path):
-        LOGGER.error(f"Decoder path not found: {args.decoder_path}")
+        LOGGER.error(f"解码器路径不存在: {args.decoder_path}")
         sys.exit(1)
     if args.encoder_path and not os.path.exists(args.encoder_path):
-        LOGGER.error(f"Encoder path not found: {args.encoder_path}")
+        LOGGER.error(f"编码器路径不存在: {args.encoder_path}")
         sys.exit(1)
     if args.fc1 and not os.path.exists(args.fc1):
-        LOGGER.error(f"FC1 path not found: {args.fc1}")
+        LOGGER.error(f"FC1 路径不存在: {args.fc1}")
         sys.exit(1)
     if args.fc2 and not os.path.exists(args.fc2):
-        LOGGER.error(f"FC2 path not found: {args.fc2}")
+        LOGGER.error(f"FC2 路径不存在: {args.fc2}")
         sys.exit(1)
     if args.style_path and not os.path.exists(args.style_path):
-        LOGGER.warning(f"Style path not found: {args.style_path}, using random style")
+        LOGGER.warning(f"风格图像路径不存在: {args.style_path}，将使用随机风格")
         args.style_path = ""
     
-    # Prepare overrides for trainer
+    # 准备训练器参数
     overrides = {
-        # SF-YOLO specific
+        # SF-YOLO 特有参数
         'teacher_alpha': args.teacher_alpha,
         'conf_thres': args.conf_thres,
         'iou_thres': args.iou_thres,
@@ -631,7 +753,12 @@ def main():
         'style_add_alpha': args.style_add_alpha,
         'save_style_samples': args.save_style_samples,
         
-        # Standard training args
+        # Test mode 参数
+        'debug_mode': args.debug_mode,
+        'debug_interval': args.debug_interval,
+        'debug_save_dir': args.debug_save_dir,
+        
+        # 标准训练参数
         'model': args.weights,
         'data': args.data,
         'epochs': args.epochs,
@@ -654,7 +781,7 @@ def main():
         'freeze': args.freeze
     }
     
-    # Create trainer and start training
+    # 创建训练器并开始训练
     trainer = SFYOLOTrainer(overrides=overrides)
     trainer.train()
 
