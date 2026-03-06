@@ -58,6 +58,7 @@ uv run python -c "import torch; print(torch.__version__)"
 
 - **不要**直接使用系统 Python 或 pip 运行脚本或安装包
 - 项目使用清华镜像源加速依赖下载，并在需要时从 PyTorch 官方源安装 CUDA 版本的 torch/torchvision
+- 如果项目根目录下存在ENVIRONMENT.md，请遵循其中的说明
 
 ## 项目依赖说明
 
