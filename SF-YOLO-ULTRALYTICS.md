@@ -70,9 +70,7 @@ uv run train_sf-yolo-ultralytics.py \
     --SSM_alpha 0.5 \
     --conf_thres 0.4 \
     --iou_thres 0.3 \
-    --val_source \
-    --project runs/sf-yolo \
-    --name city2foggy_yolo26
+    --val_source
 ```
 
 **关键参数说明**：

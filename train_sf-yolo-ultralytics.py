@@ -10,11 +10,10 @@ SF-YOLO 训练脚本（基于 YOLOv26 / Ultralytics）
 
 import argparse
 import math
-import multiprocessing
 import os
 import sys
 import time
-from copy import deepcopy
+from copy import deepcopy, copy
 from pathlib import Path
 import warnings
 import cv2
@@ -30,9 +29,12 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from ultralytics.models.yolo.detect import DetectionTrainer
-from ultralytics.utils import LOGGER, RANK, colorstr, ops, DEFAULT_CFG
+from ultralytics.utils import LOGGER, RANK, colorstr, ops, DEFAULT_CFG, YAML
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.torch_utils import unwrap_model, autocast
+from ultralytics.data import build_dataloader
+from ultralytics.data.dataset import YOLODataset
+from ultralytics.models.yolo import detect
 
 # SF-YOLO 相关模块导入
 from TargetAugment.enhance_style import get_style_images
@@ -62,10 +64,10 @@ class WeightEMA:
         
     def step(self):
         """执行 EMA 更新，将学生模型的参数更新到教师模型"""
+        # 注意：EMA 更新通过 data 属性直接操作，不需要 requires_grad
         for teacher_param, student_param in zip(self.teacher_params, self.student_params):
-            if teacher_param.requires_grad:
-                # EMA 公式: θ_teacher = α * θ_teacher + (1-α) * θ_student
-                teacher_param.data.mul_(self.alpha).add_(student_param.data, alpha=1 - self.alpha)
+            # EMA 公式: θ_teacher = α * θ_teacher + (1-α) * θ_student
+            teacher_param.data.mul_(self.alpha).add_(student_param.data, alpha=1 - self.alpha)
 
 
 class SFYOLOTrainer(DetectionTrainer):
@@ -77,6 +79,7 @@ class SFYOLOTrainer(DetectionTrainer):
     3. 教师模型生成伪标签
     4. 学生模型在风格化图像上训练，使用伪标签监督
     5. 可选的 SSM（稳定学生动量）机制
+    6. 双域验证（同时验证目标域和源域）
     
     Attributes:
         model_teacher: 教师模型，用于生成伪标签
@@ -88,6 +91,9 @@ class SFYOLOTrainer(DetectionTrainer):
         max_det: 每张图像最大检测数量
         SSM_alpha: SSM 动量系数（0 表示禁用）
         style_add_alpha: 风格迁移强度
+        source_data: 源域数据集配置路径
+        val_source: 是否在源域上验证
+        test_loader_source: 源域验证数据加载器
     """
     
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
@@ -115,12 +121,9 @@ class SFYOLOTrainer(DetectionTrainer):
         self.max_det = overrides.pop('max_det', 20)
         self.SSM_alpha = overrides.pop('SSM_alpha', 0.0)
         
-        # 教师模型最佳性能跟踪
-        self.best_fitness_teacher = 0.0
-        
         # 源域验证数据集配置（用于监控域迁移性能）
-        self.source_data = overrides.pop('source_data', None)  # 源域数据集 YAML 路径
-        self.val_source = overrides.pop('val_source', True)  # 是否在源域上验证
+        self.source_data = overrides.pop('source_data', None)
+        self.val_source = overrides.pop('val_source', True)
         
         # TAM 模块参数
         self.decoder_path = overrides.pop('decoder_path', None)
@@ -137,7 +140,7 @@ class SFYOLOTrainer(DetectionTrainer):
         
         # Test mode: 伪标签调试相关
         self.debug_mode = overrides.pop('debug_mode', False)
-        self.debug_interval = overrides.pop('debug_interval', 50)  # 每N个batch保存一次
+        self.debug_interval = overrides.pop('debug_interval', 50)
         self.debug_counter = 0
         self.debug_save_dir = Path(overrides.pop('debug_save_dir', './check/teacher_output'))
         if self.debug_mode:
@@ -162,8 +165,9 @@ class SFYOLOTrainer(DetectionTrainer):
             param.requires_grad = False
             
         # 创建教师模型的 EMA 优化器
-        teacher_params = [p for p in self.model_teacher.parameters() if p.requires_grad]
-        student_params = [p for p in self.model.parameters() if p.requires_grad]
+        # FIX: 使用所有参数，不要过滤 requires_grad（因为教师模型参数都是 False）
+        teacher_params = list(self.model_teacher.parameters())
+        student_params = list(self.model.parameters())
         self.optimizer_teacher = WeightEMA(teacher_params, student_params, alpha=self.teacher_alpha)
         
         LOGGER.info(f"{colorstr('SF-YOLO:')} 教师模型初始化完成，EMA alpha={self.teacher_alpha}")
@@ -173,25 +177,14 @@ class SFYOLOTrainer(DetectionTrainer):
         self._setup_source_validator()
         
     def _setup_source_validator(self):
-        """设置源域验证器用于监控域迁移性能"""
+        """设置源域验证器用于监控域迁移性能
+        
+        注意：验证器会在首次验证时延迟初始化，以确保使用正确的数据加载器
+        """
         self.validator_source = None
+        self.test_loader_source = None
         if self.source_data and self.val_source:
-            try:
-                # 保存原始数据配置
-                original_data = self.args.data
-                # 临时切换数据源配置
-                self.args.data = self.source_data
-                
-                # 创建源域验证器
-                self.validator_source = self.get_validator()
-                
-                # 恢复原始数据配置
-                self.args.data = original_data
-                
-                LOGGER.info(f"{colorstr('SF-YOLO:')} 源域验证器初始化完成，数据: {self.source_data}")
-            except Exception as e:
-                LOGGER.warning(f"{colorstr('SF-YOLO:')} 源域验证器初始化失败: {e}")
-                self.validator_source = None
+            LOGGER.info(f"{colorstr('SF-YOLO:')} 源域验证将在首次验证时初始化，数据: {self.source_data}")
         elif not self.source_data:
             LOGGER.info(f"{colorstr('SF-YOLO:')} 未提供源域数据配置，跳过源域验证")
         
@@ -223,6 +216,172 @@ class SFYOLOTrainer(DetectionTrainer):
             LOGGER.info(f"{colorstr('SF-YOLO:')} TAM 初始化完成，风格迁移强度 style_add_alpha={self.style_add_alpha}")
         else:
             LOGGER.warning(f"{colorstr('SF-YOLO:')} 未提供 TAM 权重路径，风格增强功能已禁用")
+    
+    def validate(self):
+        """同时在目标域和源域验证集上运行验证
+        
+        重写父类方法以：
+        1. 在目标域验证集上验证（原有功能）
+        2. 在源域验证集上验证（新增功能，用于监控域迁移性能）
+        
+        Returns:
+            (tuple): 包含目标域指标和 fitness 的元组
+        """
+        from torch import distributed as dist
+        
+        # 同步 EMA 缓冲区（多GPU时）
+        if self.ema and self.world_size > 1:
+            for buffer in self.ema.ema.buffers():
+                dist.broadcast(buffer, src=0)
+        
+        # ========== 目标域验证 ==========
+        metrics_target = self.validator(self)
+        fitness_target = None
+        if metrics_target is not None:
+            fitness_target = metrics_target.pop("fitness", -self.loss.detach().cpu().numpy())
+            if not self.best_fitness or self.best_fitness < fitness_target:
+                self.best_fitness = fitness_target
+        
+        # ========== 源域验证 ==========
+        metrics_source = None
+        fitness_source = None
+        if self.source_data and self.val_source:
+            try:
+                # 保存原始配置
+                original_data = self.args.data
+                original_test_loader = self.test_loader
+                
+                # 切换到源域数据配置
+                self.args.data = self.source_data
+                
+                # 创建源域验证数据加载器（如果尚未创建）
+                if self.test_loader_source is None:
+                    # 解析源域 YAML 配置文件
+                    source_data_dict = YAML.load(self.source_data)
+                    
+                    # 检查 YAML 加载结果
+                    if source_data_dict is None:
+                        raise ValueError(f"无法加载源域 YAML 文件: {self.source_data}")
+                    
+                    # 获取源域验证集路径
+                    if isinstance(source_data_dict.get('val'), list):
+                        val_path = source_data_dict['val'][0]
+                    else:
+                        val_path = source_data_dict['val']
+                    
+                    # 如果路径是相对路径，基于 YAML 文件位置解析
+                    path_base = source_data_dict.get('path', '')
+                    if path_base:
+                        val_path = str(Path(path_base) / val_path)
+                    else:
+                        val_path = str(Path(self.source_data).parent / val_path)
+                    
+                    LOGGER.info(f"{colorstr('SF-YOLO:')} 加载源域验证数据: {val_path}")
+                    
+                    # 构建源域验证数据集
+                    dataset_source = YOLODataset(
+                        img_path=val_path,
+                        imgsz=self.args.imgsz,
+                        batch_size=self.args.batch,
+                        augment=False,
+                        hyp=self.args,
+                        rect=self.args.rect,
+                        cache=self.args.cache or None,
+                        single_cls=self.args.single_cls or False,
+                        stride=self.model.stride.max().item() if hasattr(self.model, 'stride') else 32,
+                        pad=0.5,
+                        task=getattr(self, 'task', 'detect'),
+                    )
+                    
+                    # 构建源域验证数据加载器
+                    self.test_loader_source = build_dataloader(
+                        dataset_source, 
+                        self.args.batch, 
+                        self.args.workers, 
+                        shuffle=False, 
+                        rank=RANK
+                    )
+                    LOGGER.info(f"{colorstr('SF-YOLO:')} 源域验证数据加载器创建完成，共 {len(dataset_source)} 张图像")
+                
+                # 切换到源域验证数据加载器
+                self.test_loader = self.test_loader_source
+                
+                # 创建新的验证器（使用源域数据加载器）
+                validator_source = detect.DetectionValidator(
+                    self.test_loader_source, 
+                    save_dir=self.save_dir, 
+                    args=copy(self.args), 
+                    _callbacks=self.callbacks
+                )
+                # 设置 loss_names（如果目标域验证器已设置）
+                if hasattr(self.validator, 'loss_names') and self.validator.loss_names is not None:
+                    validator_source.loss_names = self.validator.loss_names
+                else:
+                    validator_source.loss_names = ["box_loss", "cls_loss", "dfl_loss"]
+                
+                # 运行源域验证
+                metrics_source = validator_source(self)
+                
+                # 恢复原始配置
+                self.args.data = original_data
+                self.test_loader = original_test_loader
+                
+                if metrics_source is not None:
+                    fitness_source = metrics_source.pop("fitness", -self.loss.detach().cpu().numpy())
+                    
+            except Exception as e:
+                LOGGER.warning(f"{colorstr('SF-YOLO:')} 源域验证失败: {e}")
+                import traceback
+                LOGGER.debug(traceback.format_exc())
+                metrics_source = None
+        
+        # 存储源域指标供后续使用（如保存指标到CSV）
+        self.metrics_source = metrics_source
+        self.fitness_source = fitness_source
+        
+        # 记录验证结果
+        if RANK in {-1, 0}:
+            if fitness_target is not None:
+                log_msg = f"{colorstr('SF-YOLO:')} 目标域验证 fitness={fitness_target:.4f}"
+                if fitness_source is not None:
+                    gap = fitness_target - fitness_source
+                    log_msg += f", 源域 fitness={fitness_source:.4f}, 域差距={gap:+.4f}"
+                LOGGER.info(log_msg)
+        
+        return metrics_target, fitness_target
+    
+    def save_metrics(self, metrics):
+        """保存训练指标到 CSV 文件（包含源域和目标域）
+        
+        重写父类方法以同时保存源域和目标域的验证指标
+        """
+        # 合并目标域和源域指标
+        all_metrics = dict(metrics)
+        
+        # 添加源域指标（如果有）
+        if hasattr(self, 'metrics_source') and self.metrics_source is not None:
+            for key, value in self.metrics_source.items():
+                all_metrics[f"source_{key}"] = value
+            if hasattr(self, 'fitness_source') and self.fitness_source is not None:
+                all_metrics["source_fitness"] = self.fitness_source
+        
+        # 添加域差距指标
+        if hasattr(self, 'fitness_source') and self.fitness_source is not None:
+            target_fitness = all_metrics.get('fitness', 0)
+            all_metrics["domain_gap"] = target_fitness - self.fitness_source
+        
+        keys, vals = list(all_metrics.keys()), list(all_metrics.values())
+        n = len(all_metrics) + 2  # number of cols (epoch, time, metrics...)
+        t = time.time() - self.train_time_start
+        
+        self.csv.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 写入表头（如果是新文件）
+        s = "" if self.csv.exists() else ("%s," * n % ("epoch", "time", *keys)).rstrip(",") + "\n"
+        
+        # 写入数据
+        with open(self.csv, "a", encoding="utf-8") as f:
+            f.write(s + ("%.6g," * n % (self.epoch + 1, t, *vals)).rstrip(",") + "\n")
     
     def save_model(self):
         """保存学生模型和教师模型的训练检查点
@@ -278,11 +437,19 @@ class SFYOLOTrainer(DetectionTrainer):
             # 暂时切换到教师模型进行验证
             original_model = self.model
             self.model = self.model_teacher
-            teacher_metrics, teacher_fitness = self.validate()
-            self.model = original_model
+            try:
+                teacher_metrics, teacher_fitness = self.validate()
+            except Exception as e:
+                LOGGER.warning(f"{colorstr('SF-YOLO:')} 教师模型验证失败: {e}")
+                teacher_metrics = {}
+                teacher_fitness = 0.0
+            finally:
+                self.model = original_model
             
             # 更新教师模型的最佳性能
-            if teacher_fitness > self.best_fitness_teacher:
+            if not hasattr(self, 'best_fitness_teacher'):
+                self.best_fitness_teacher = 0.0
+            if teacher_fitness is not None and teacher_fitness > self.best_fitness_teacher:
                 self.best_fitness_teacher = teacher_fitness
                 is_best_teacher = True
             else:
@@ -298,7 +465,7 @@ class SFYOLOTrainer(DetectionTrainer):
                     "optimizer": self.optimizer.state_dict(),
                     "scaler": self.scaler.state_dict(),
                     "train_args": vars(self.args),
-                    "train_metrics": {**teacher_metrics, **{"fitness": teacher_fitness}},
+                    "train_metrics": {**(teacher_metrics or {}), **{"fitness": teacher_fitness or 0.0}},
                     "date": datetime.now().isoformat(),
                     "version": __version__,
                     "model_type": "teacher",  # 标记为教师模型
@@ -319,111 +486,7 @@ class SFYOLOTrainer(DetectionTrainer):
             
             if (self.save_period > 0) and (self.epoch % self.save_period == 0):
                 (self.wdir / f"epoch{self.epoch}_teacher.pt").write_bytes(serialized_teacher)
-            
-            LOGGER.debug(f"{colorstr('SF-YOLO:')} 已保存教师模型检查点 "
-                        f"(last_teacher.pt, fitness={teacher_fitness:.4f})")
     
-    def validate(self):
-        """同时在目标域和源域验证集上运行验证
-        
-        重写父类方法以：
-        1. 在目标域验证集上验证（原有功能）
-        2. 在源域验证集上验证（新增功能，用于监控域迁移性能）
-        
-        Returns:
-            (tuple): 包含目标域指标和 fitness 的元组
-        """
-        from torch import distributed as dist
-        
-        # 同步 EMA 缓冲区（多GPU时）
-        if self.ema and self.world_size > 1:
-            for buffer in self.ema.ema.buffers():
-                dist.broadcast(buffer, src=0)
-        
-        # ========== 目标域验证 ==========
-        metrics_target = self.validator(self)
-        fitness_target = None
-        if metrics_target is not None:
-            fitness_target = metrics_target.pop("fitness", -self.loss.detach().cpu().numpy())
-            if not self.best_fitness or self.best_fitness < fitness_target:
-                self.best_fitness = fitness_target
-        
-        # ========== 源域验证 ==========
-        metrics_source = None
-        fitness_source = None
-        if self.validator_source is not None and self.val_source:
-            try:
-                # 保存原始验证器
-                original_validator = self.validator
-                # 切换到源域验证器
-                self.validator = self.validator_source
-                
-                # 保存原始数据配置并切换
-                original_data = self.args.data
-                self.args.data = self.source_data
-                
-                # 运行源域验证
-                metrics_source = self.validator(self)
-                
-                # 恢复原始配置
-                self.args.data = original_data
-                self.validator = original_validator
-                
-                if metrics_source is not None:
-                    fitness_source = metrics_source.pop("fitness", -self.loss.detach().cpu().numpy())
-                    
-            except Exception as e:
-                LOGGER.warning(f"{colorstr('SF-YOLO:')} 源域验证失败: {e}")
-                metrics_source = None
-        
-        # 存储源域指标供后续使用（如保存指标到CSV）
-        self.metrics_source = metrics_source
-        self.fitness_source = fitness_source
-        
-        # 记录验证结果
-        if RANK in {-1, 0}:
-            if fitness_target is not None:
-                log_msg = f"{colorstr('SF-YOLO:')} 目标域验证 fitness={fitness_target:.4f}"
-                if fitness_source is not None:
-                    gap = fitness_target - fitness_source
-                    log_msg += f", 源域 fitness={fitness_source:.4f}, 域差距={gap:+.4f}"
-                LOGGER.info(log_msg)
-        
-        return metrics_target, fitness_target
-    
-    def save_metrics(self, metrics):
-        """保存训练指标到 CSV 文件（包含源域和目标域）
-        
-        重写父类方法以同时保存源域和目标域的验证指标
-        """
-        # 合并目标域和源域指标
-        all_metrics = dict(metrics)
-        
-        # 添加源域指标（如果有）
-        if hasattr(self, 'metrics_source') and self.metrics_source is not None:
-            for key, value in self.metrics_source.items():
-                all_metrics[f"source_{key}"] = value
-            if hasattr(self, 'fitness_source') and self.fitness_source is not None:
-                all_metrics["source_fitness"] = self.fitness_source
-        
-        # 添加域差距指标
-        if hasattr(self, 'fitness_source') and self.fitness_source is not None:
-            target_fitness = all_metrics.get('fitness', 0)
-            all_metrics["domain_gap"] = target_fitness - self.fitness_source
-        
-        keys, vals = list(all_metrics.keys()), list(all_metrics.values())
-        n = len(all_metrics) + 2  # number of cols (epoch, time, metrics...)
-        t = time.time() - self.train_time_start
-        
-        self.csv.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 写入表头（如果是新文件）
-        s = "" if self.csv.exists() else ("%s," * n % ("epoch", "time", *keys)).rstrip(",") + "\n"
-        
-        # 写入数据
-        with open(self.csv, "a", encoding="utf-8") as f:
-            f.write(s + ("%.6g," * n % (self.epoch + 1, t, *vals)).rstrip(",") + "\n")
-            
     def _apply_style_augmentation(self, imgs):
         """使用 TAM 对图像进行风格增强
         
@@ -645,7 +708,7 @@ class SFYOLOTrainer(DetectionTrainer):
         
         LOGGER.info(f"{colorstr('SF-YOLO:')} 已保存学生模型对比图像到 {student_save_dir}")
 
-    def _save_debug_visualization(self, imgs, imgs_style, pseudo_labels, batch_idx, prefix="debug"):
+    def _save_teacher_output(self, imgs, imgs_style, pseudo_labels, batch_idx, prefix="debug"):
         """保存调试可视化图像（原始图像、风格化图像、伪标签）
         
         Args:
@@ -721,11 +784,13 @@ class SFYOLOTrainer(DetectionTrainer):
             combined = np.vstack([title_bar, combined])
             
             # 保存图像
-            save_path = self.debug_save_dir / f"{prefix}_epoch{self.epoch}_batch{batch_idx}_img{i}.jpg"
+            teacher_save_dir = Path(self.debug_save_dir) / "teacher_output"
+            teacher_save_dir.mkdir(parents=True, exist_ok=True)
+            save_path = teacher_save_dir / f"{prefix}_epoch{self.epoch}_batch{batch_idx}_img{i}.jpg"
             cv2.imwrite(str(save_path), combined)
             
             # 同时保存伪标签的文本信息
-            txt_path = self.debug_save_dir / f"{prefix}_epoch{self.epoch}_batch{batch_idx}_img{i}.txt"
+            txt_path = teacher_save_dir / f"{prefix}_epoch{self.epoch}_batch{batch_idx}_img{i}.txt"
             with open(txt_path, 'w') as f:
                 f.write(f"Epoch: {self.epoch}, Batch: {batch_idx}, Image: {i}\n")
                 f.write(f"conf_thres: {self.conf_thres}, iou_thres: {self.iou_thres}\n")
@@ -736,7 +801,7 @@ class SFYOLOTrainer(DetectionTrainer):
                         x1, y1, x2, y2, conf, cls = det.cpu().numpy()[:6]
                         f.write(f"{x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f} {conf:.4f} {int(cls)}\n")
         
-        LOGGER.info(f"{colorstr('SF-YOLO:')} 已保存调试图像到 {self.debug_save_dir}")
+        LOGGER.info(f"{colorstr('SF-YOLO:')} 已保存调试图像到 {teacher_save_dir}")
     
     def _convert_pseudo_labels_to_targets(self, pseudo_labels, batch_size, img_height, img_width):
         """将伪标签转换为损失计算所需的格式
@@ -790,14 +855,20 @@ class SFYOLOTrainer(DetectionTrainer):
             student_state_dict = self.model.state_dict()
             teacher_state_dict = self.model_teacher.state_dict()
             
+            # 执行 SSM 更新（只更新浮点类型参数）
+            update_count = 0
             for name, param in student_state_dict.items():
                 if name in teacher_state_dict:
+                    # 跳过整数类型参数（如 batch norm 的 num_batches_tracked）
+                    if param.dtype in [torch.long, torch.int]:
+                        continue
                     param.data.copy_(
                         (1.0 - self.SSM_alpha) * param.data + 
                         self.SSM_alpha * teacher_state_dict[name].data
                     )
+                    update_count += 1
             
-            LOGGER.info(f"{colorstr('SF-YOLO:')} 已在第 {self.epoch} 轮应用 SSM 更新，alpha={self.SSM_alpha}")
+            LOGGER.info(f"{colorstr('SF-YOLO:')} 已在第 {self.epoch} 轮应用 SSM 更新，alpha={self.SSM_alpha}，更新了 {update_count} 个参数")
     
     def _do_train(self):
         """SF-YOLO 自定义训练循环
@@ -919,7 +990,7 @@ class SFYOLOTrainer(DetectionTrainer):
                     
                     # Test mode: 保存伪标签和学生模型输出可视化
                     if self.debug_mode and self.debug_counter % self.debug_interval == 0:
-                        self._save_debug_visualization(imgs, imgs_style, pseudo_labels, i, prefix="pseudo")
+                        self._save_teacher_output(imgs, imgs_style, pseudo_labels, i, prefix="pseudo")
                         # 同时保存学生模型的输出（与教师伪标签对比）
                         self._save_student_output(imgs_style, preds_student, pseudo_labels, i)
                     self.debug_counter += 1
@@ -947,8 +1018,8 @@ class SFYOLOTrainer(DetectionTrainer):
                     last_opt_step = ni
                     # 优化学生模型
                     self.optimizer_step()
-                    # 使用 EMA 更新教师模型
                     
+                    # 使用 EMA 更新教师模型
                     self.model_teacher.train()
                     self.model_teacher.zero_grad()
                     self.optimizer_teacher.step()
@@ -1095,12 +1166,8 @@ def parse_args():
     parser.add_argument("--style_add_alpha", type=float, default=1.0, help="风格迁移强度")
     parser.add_argument("--save_style_samples", action="store_true", help="保存风格样本图像")
     
-    # Test mode 参数
-    parser.add_argument("--debug_mode", action="store_true", help="启用调试模式，保存伪标签可视化")
-    parser.add_argument("--debug_interval", type=int, default=50, help="每隔N个batch保存一次调试图像")
-    parser.add_argument("--debug_save_dir", type=str, default="./check", help="调试图像保存目录")
-    
     # 训练参数
+    parser.add_argument("--cache", type=str, default="disk", help="数据集缓存模式: 'ram'/'disk'/False, 默认 'disk'")
     parser.add_argument("--lr0", type=float, default=0.01, help="初始学习率")
     parser.add_argument("--lrf", type=float, default=0.01, help="最终学习率系数")
     parser.add_argument("--momentum", type=float, default=0.937, help="SGD 动量")
@@ -1111,14 +1178,21 @@ def parse_args():
     parser.add_argument("--cos_lr", action="store_true", help="使用余弦学习率调度")
     parser.add_argument("--amp", action="store_true", default=True, help="使用自动混合精度")
     parser.add_argument("--freeze", type=int, nargs="+", default=[0], help="冻结层索引")
+    
+    # Test mode 参数
+    parser.add_argument("--debug_mode", action="store_true", help="启用调试模式，保存伪标签可视化")
+    parser.add_argument("--debug_interval", type=int, default=50, help="每隔N个batch保存一次调试图像")
+    parser.add_argument("--debug_save_dir", type=str, default="./check", help="调试图像保存目录")
 
     return parser.parse_args()
 
 
 def main():
+    
+    torch.multiprocessing.set_start_method('spawn')
+    
     """SF-YOLO 训练主函数"""
     args = parse_args()
-    multiprocessing.set_start_method("spawn")
     
     # 验证 TAM 权重路径
     if args.decoder_path and not os.path.exists(args.decoder_path):
@@ -1188,7 +1262,8 @@ def main():
         'seed': args.seed,
         'cos_lr': args.cos_lr,
         'amp': args.amp,
-        'freeze': args.freeze
+        'freeze': args.freeze,
+        'cache': args.cache
     }
     
     # 创建训练器并开始训练
