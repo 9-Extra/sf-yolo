@@ -121,6 +121,9 @@ class SFYOLOTrainer(DetectionTrainer):
         self.max_det = overrides.pop('max_det', 20)
         self.SSM_alpha = overrides.pop('SSM_alpha', 0.0)
         
+        # 教师模型伪标签生成头选择
+        self.teacher_head = overrides.pop('teacher_head', 'one2one')  # 'one2one' 或 'one2many'
+        
         # 源域验证数据集配置（用于监控域迁移性能）
         self.source_data = overrides.pop('source_data', None)
         self.val_source = overrides.pop('val_source', True)
@@ -131,6 +134,7 @@ class SFYOLOTrainer(DetectionTrainer):
         self.fc1_path = overrides.pop('fc1', None)
         self.fc2_path = overrides.pop('fc2', None)
         self.style_path = overrides.pop('style_path', '')
+        self.compile_tam = overrides.pop('compile_tam', False)
         self.style_add_alpha = overrides.pop('style_add_alpha', 1.0)
         self.save_style_samples = overrides.pop('save_style_samples', False)
         self.random_style = self.style_path == ''
@@ -160,6 +164,16 @@ class SFYOLOTrainer(DetectionTrainer):
         LOGGER.info(f"{colorstr('SF-YOLO:')} 正在创建教师模型...")
         self.model_teacher = deepcopy(self.model).eval()
         
+        # 编译教师模型（如果启用了 compile）
+        if self.args.compile:
+            from ultralytics.utils.torch_utils import attempt_compile
+            self.model_teacher = attempt_compile(
+                self.model_teacher, 
+                device=self.device, 
+                mode=self.args.compile
+            )
+            LOGGER.info(f"{colorstr('SF-YOLO:')} 教师模型 torch.compile 完成")
+        
         # 冻结教师模型参数（不参与梯度更新，只通过 EMA 更新）
         for param in self.model_teacher.parameters():
             param.requires_grad = False
@@ -171,6 +185,7 @@ class SFYOLOTrainer(DetectionTrainer):
         self.optimizer_teacher = WeightEMA(teacher_params, student_params, alpha=self.teacher_alpha)
         
         LOGGER.info(f"{colorstr('SF-YOLO:')} 教师模型初始化完成，EMA alpha={self.teacher_alpha}")
+        LOGGER.info(f"{colorstr('SF-YOLO:')} 教师伪标签生成头: {self.teacher_head}")
         LOGGER.info(f"{colorstr('SF-YOLO:')} SSM_alpha={self.SSM_alpha}, conf_thres={self.conf_thres}, iou_thres={self.iou_thres}")
         
         # 初始化源域验证器（如果提供了源域数据配置）
@@ -210,6 +225,7 @@ class SFYOLOTrainer(DetectionTrainer):
             tam_args.log_dir = str(self.save_dir / 'enhance_style_samples')
             tam_args.save_style_samples = self.save_style_samples
             tam_args.imgs_paths = []
+            tam_args.compile_tam = self.compile_tam
             
             self.tam_args = tam_args
             self.adain = enhance_vgg16(tam_args)
@@ -509,26 +525,94 @@ class SFYOLOTrainer(DetectionTrainer):
         
         return styled_imgs
     
-    def _generate_pseudo_labels(self, preds):
-        """从教师模型预测中生成伪标签
+    def _get_teacher_predictions_one2one(self, imgs):
+        """使用 one2one 头（端到端推理头）获取教师模型预测
+        
+        one2one 头使用 top-k 选择替代传统 NMS，直接输出最终检测结果。
         
         Args:
-            preds: 教师模型的原始预测输出
+            imgs: 输入图像张量 (B, C, H, W)
             
         Returns:
-            每张图像的伪标签列表
+            每张图像的伪标签列表，每个元素为 [N, 6] 张量 (x1, y1, x2, y2, conf, cls)
         """
-        # 应用非极大值抑制（NMS）获取最终检测结果
-        pred_nms = non_max_suppression(
-            preds,
-            conf_thres=self.conf_thres,
-            iou_thres=self.iou_thres,
-            multi_label=True,
-            agnostic=self.args.single_cls,
-            max_det=self.max_det,
-        )
+        self.model_teacher.eval()
+        with torch.no_grad():
+            # YOLOv26 end2end 模型返回 (processed_output, preds_dict)
+            preds_teacher, _ = self.model_teacher._predict_once(imgs)
+     
+            # one2one 输出格式: [batch, max_det, 6] (x1, y1, x2, y2, score, cls)
+            # 需要按置信度过滤并转换为列表格式
+            pseudo_labels = []
+            for i in range(preds_teacher.shape[0]):
+                det = preds_teacher[i]  # [max_det, 6]
+                # 过滤低置信度检测
+                mask = det[:, 4] > self.conf_thres
+                det = det[mask]
+                # 限制最大检测数量
+                if len(det) > self.max_det:
+                    det = det[:self.max_det]
+                pseudo_labels.append(det)
+            
+            return pseudo_labels
+    
+    def _get_teacher_predictions_one2many(self, imgs):
+        """使用 one2many 头（训练头）+ NMS 获取教师模型预测
         
-        return pred_nms
+        one2many 头产生密集预测，需要经过 NMS 过滤。
+        注意：one2many 头是训练头，检测质量通常不如 one2one 推理头。
+        
+        Args:
+            imgs: 输入图像张量 (B, C, H, W)
+            
+        Returns:
+            每张图像的伪标签列表，每个元素为 [N, 6] 张量 (x1, y1, x2, y2, conf, cls)
+        """
+        from ultralytics.utils.tal import make_anchors
+        
+        self.model_teacher.eval()
+        with torch.no_grad():
+            # 使用 _predict_once 获取两个头的输出
+            _, preds_dict = self.model_teacher._predict_once(imgs)
+            preds_one2many = preds_dict["one2many"]
+            
+            # 获取 head
+            head = self.model_teacher.model[-1]
+            
+            # 解码预测（参考 _get_decode_boxes 的实现）
+            feats = preds_one2many["feats"]
+            stride = head.stride
+            anchors, strides = make_anchors(feats, stride, 0.5)
+            anchors = anchors.transpose(0, 1).unsqueeze(0)  # [1, 2, num_anchors]
+            strides = strides.transpose(0, 1)  # [1, num_anchors]
+            
+            # 解码边界框
+            pred_distri = preds_one2many["boxes"]  # [batch, 4*reg_max, num_anchors]
+            if head.reg_max > 1:
+                pred_bboxes = head.decode_bboxes(head.dfl(pred_distri), anchors)
+            else:
+                pred_bboxes = head.decode_bboxes(pred_distri, anchors)
+            # pred_bboxes: [batch, 4, num_anchors] in xyxy format (end2end 强制 xyxy)
+            pred_bboxes = pred_bboxes * strides  # 乘以 strides 得到原图坐标
+            
+            # 对 scores 应用 sigmoid
+            pred_scores = preds_one2many["scores"].sigmoid()  # [batch, nc, num_anchors]
+            
+            # NMS 期望 BCN 格式 [batch, 4+nc, num_anchors]
+            preds_combined = torch.cat([pred_bboxes, pred_scores], dim=1)
+            
+            # 应用 NMS
+            pseudo_labels = non_max_suppression(
+                preds_combined,
+                conf_thres=self.conf_thres,
+                iou_thres=self.iou_thres,
+                multi_label=True,
+                agnostic=self.args.single_cls,
+                max_det=self.max_det,
+            )
+            
+            return pseudo_labels
+
     
     def _save_student_output(self, imgs_style, preds_student, pseudo_labels, batch_idx):
         """保存学生模型的输出可视化（与教师伪标签对比）
@@ -712,7 +796,7 @@ class SFYOLOTrainer(DetectionTrainer):
         LOGGER.info(f"{colorstr('SF-YOLO:')} 已保存学生模型对比图像到 {student_save_dir}")
 
     def _save_teacher_output(self, imgs, imgs_style, pseudo_labels, batch_idx, prefix="debug"):
-        """保存调试可视化图像（原始图像、风格化图像、伪标签）
+        """保存教师模型可视化图像（原始图像、风格化图像、伪标签）
         
         Args:
             imgs: 原始图像张量 (B, C, H, W)，范围 [0, 1]
@@ -969,14 +1053,12 @@ class SFYOLOTrainer(DetectionTrainer):
                     imgs_style = self._apply_style_augmentation(imgs)
                     
                     # 教师模型在前向传播（用于生成伪标签）
-                    self.model_teacher.eval()
-                    with torch.no_grad():
-                        preds_teacher = self.model_teacher(imgs)
-                        if isinstance(preds_teacher, (list, tuple)):
-                            preds_teacher = preds_teacher[0]
-                    
-                    # 生成伪标签
-                    pseudo_labels = self._generate_pseudo_labels(preds_teacher)
+                    if self.teacher_head == 'one2one':
+                        # 使用 one2one 头（端到端推理，内置 top-k 选择）
+                        pseudo_labels = self._get_teacher_predictions_one2one(imgs)
+                    else:
+                        # 使用 one2many 头 + NMS
+                        pseudo_labels = self._get_teacher_predictions_one2many(imgs)
             
                     # 将伪标签转换为训练目标格式
                     pseudo_cls, pseudo_bboxes, pseudo_batch_idx = self._convert_pseudo_labels_to_targets(
@@ -1155,6 +1237,8 @@ def parse_args():
     
     # SF-YOLO 特有参数
     parser.add_argument("--teacher_alpha", type=float, default=0.999, help="教师模型 EMA alpha")
+    parser.add_argument("--teacher_head", type=str, default='one2one', choices=['one2one', 'one2many'],
+                        help="教师模型伪标签生成头: 'one2one' (端到端推理，跳过NMS) 或 'one2many' (密集预测+NMS)")
     parser.add_argument("--conf_thres", type=float, default=0.4, help="伪标签置信度阈值")
     parser.add_argument("--iou_thres", type=float, default=0.3, help="NMS IoU 阈值")
     parser.add_argument("--max_det", type=int, default=20, help="每张图像最大检测数")
@@ -1186,6 +1270,12 @@ def parse_args():
     parser.add_argument("--debug_mode", action="store_true", help="启用调试模式，保存伪标签可视化")
     parser.add_argument("--debug_interval", type=int, default=50, help="每隔N个batch保存一次调试图像")
     parser.add_argument("--debug_save_dir", type=str, default="./check", help="调试图像保存目录")
+    
+    # torch.compile 参数
+    parser.add_argument("--compile", type=str, default=False, 
+                        help="使用 torch.compile 编译模型以提高训练速度，可选: 'default', 'reduce-overhead', 'max-autotune-no-cudagraphs', True, False")
+    parser.add_argument("--compile-tam", type=str, default=False,
+                        help="使用 torch.compile 编译 TAM 模块，可选: 'default', 'reduce-overhead', 'max-autotune-no-cudagraphs', True, False")
 
     return parser.parse_args()
 
@@ -1224,6 +1314,7 @@ def main():
     overrides = {
         # SF-YOLO 特有参数
         'teacher_alpha': args.teacher_alpha,
+        'teacher_head': args.teacher_head,
         'conf_thres': args.conf_thres,
         'iou_thres': args.iou_thres,
         'max_det': args.max_det,
@@ -1266,7 +1357,9 @@ def main():
         'cos_lr': args.cos_lr,
         'amp': args.amp,
         'freeze': args.freeze,
-        'cache': args.cache
+        'cache': args.cache,
+        'compile': args.compile,
+        'compile_tam': args.compile_tam
     }
     
     # 创建训练器并开始训练

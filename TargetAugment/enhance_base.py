@@ -4,11 +4,80 @@ import numpy as np
 # from model.utils.config import cfg
 import cv2
 import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 import matplotlib
 import os
 import random
 from torchvision import transforms as transforms
+
+
+class TAMWrapper(nn.Module):
+    """TAM 编译包装器 - 用于 torch.compile
+    
+    将 TAM 的所有子模块封装为一个整体 nn.Module，
+    以便使用 torch.compile 进行整体编译加速。
+    """
+    def __init__(self, encoders, decoders, fc1, fc2):
+        super().__init__()
+        # 将模块列表转换为 ModuleList 以便正确注册
+        self.encoders = nn.ModuleList(encoders)
+        self.decoders = nn.ModuleList(decoders)
+        self.fc1 = fc1
+        self.fc2 = fc2
+        self.num = len(encoders)
+    
+    def forward(self, content, style, flag=0, alpha=1.0):
+        """TAM 风格迁移的前向传播
+        
+        Args:
+            content: 内容图像 [1, C, H, W]
+            style: 风格图像 [1, C, H, W]
+            flag: 编码器起始层索引
+            alpha: 风格迁移强度
+            
+        Returns:
+            风格化后的图像 [1, C, H, W]
+        """
+        # 编码阶段
+        for i in range(flag, self.num):
+            content = self.encoders[i](content).float()
+            style = self.encoders[i](style).float()
+        
+        # 自适应实例归一化
+        feat = self._adaptive_instance_normalization(content, style)
+        feat = feat * alpha + content * (1 - alpha)
+        
+        # 解码阶段
+        for i in range(self.num - flag):
+            feat = self.decoders[i](feat)
+        
+        return feat
+    
+    def _adaptive_instance_normalization(self, content_feat, style_feat):
+        """自适应实例归一化"""
+        size = content_feat.size()
+        style_mean, style_std = self._calc_mean_std(style_feat)
+        content_mean, content_std = self._calc_mean_std(content_feat)
+        
+        normalized_feat = (content_feat - content_mean.expand(size)) / content_std.expand(size)
+        
+        mixed_style_mean = torch.cat((style_mean, content_mean), 1).squeeze(2).squeeze(2)
+        mixed_style_std = torch.cat((style_std, content_std), 1).squeeze(2).squeeze(2)
+        
+        new_style_mean = self.fc1(mixed_style_mean).unsqueeze(2).unsqueeze(2)
+        new_style_std = self.fc2(mixed_style_std).unsqueeze(2).unsqueeze(2)
+        
+        return normalized_feat * new_style_std.expand(size) + new_style_mean.expand(size)
+    
+    def _calc_mean_std(self, feat, eps=1e-5):
+        """计算特征的均值和标准差"""
+        N, C = feat.size()[:2]
+        feat_var = feat.view(N, C, -1).var(dim=2) + eps
+        feat_std = feat_var.sqrt().view(N, C, 1, 1)
+        feat_mean = feat.view(N, C, -1).mean(dim=2).view(N, C, 1, 1)
+        return feat_mean, feat_std
+
 
 class enhance_base:
     def add_style(self, content, flag, save_images=False):
@@ -50,6 +119,8 @@ class enhance_base:
         self.fc2 = fcs[1]
         self.alpha = args.style_add_alpha
         self.args = args
+        self.compiled_wrapper = None
+        
         if args.cuda:
             for encoder in self.encoders:
                 encoder.cuda()
@@ -63,7 +134,11 @@ class enhance_base:
             decoder.eval()
         self.fc1.eval()
         self.fc2.eval()
-
+        
+        # 使用 torch.compile 编译 TAM（整体编译，参考 attempt_compile）
+        if getattr(args, 'compile_tam', False) and hasattr(torch, 'compile'):
+            self._compile_tam(args)
+        
         self.style_image = None
         if not self.args.random_style:
             self.style_image = self.load_and_process_style_img(args.style_path)
@@ -81,6 +156,33 @@ class enhance_base:
             shutil.rmtree(path)
         self.step = 0
 
+    def _compile_tam(self, args):
+        """编译 TAM 模块 - 参考 ultralytics.utils.torch_utils.attempt_compile
+        
+        创建 TAMWrapper 包装器并编译，以提高推理速度。
+        """
+        compile_mode = args.compile_tam if isinstance(args.compile_tam, str) else 'default'
+        prefix = "[TAM compile]"
+        print(f"{prefix} starting torch.compile with '{compile_mode}' mode...")
+        
+        try:
+            # 创建包装器并移动到 GPU
+            device = torch.device('cuda' if args.cuda else 'cpu')
+            wrapper = TAMWrapper(self.encoders, self.decoders, self.fc1, self.fc2)
+            wrapper = wrapper.to(device)
+            wrapper.eval()
+            
+            # 编译包装器
+            import time
+            t0 = time.perf_counter()
+            self.compiled_wrapper = torch.compile(wrapper, mode=compile_mode, backend='inductor')
+            t_compile = time.perf_counter() - t0
+            
+            print(f"{prefix} compile complete in {t_compile:.1f}s")
+            
+        except Exception as e:
+            print(f"{prefix} torch.compile failed, continuing uncompiled: {e}")
+            self.compiled_wrapper = None
 
     def get_style_feats(self, args):
         if self.style_image is None:
@@ -107,23 +209,31 @@ class enhance_base:
         return im
     
     def style_transfer(self, content, style, flag, alpha=1.0):
+        """风格迁移 - 如果有 compiled_wrapper 则使用编译版本"""
         assert (0.0 <= alpha <= 1.0)
         assert (len(content.size()) == 3)
         content = content.unsqueeze(0)
         style = style.unsqueeze(0)
-        size=content.size()
-        with torch.no_grad():
-            for i in range(flag, self.num):
-                content = self.encoders[i](content).float()
-                style = self.encoders[i](style).float()
-            feat = self.adaptive_instance_normalization(content, style, self.fc1, self.fc2)
-            feat = feat * alpha + content * (1 - alpha)
-            for i in range(self.num-flag):
-                feat = self.decoders[i](feat)
+        size = content.size()
+        
+        # 使用编译后的包装器（如果可用）
+        if self.compiled_wrapper is not None:
+            with torch.no_grad():
+                feat = self.compiled_wrapper(content, style, flag, alpha)
+        else:
+            # 原始实现
+            with torch.no_grad():
+                for i in range(flag, self.num):
+                    content = self.encoders[i](content).float()
+                    style = self.encoders[i](style).float()
+                feat = self.adaptive_instance_normalization(content, style, self.fc1, self.fc2)
+                feat = feat * alpha + content * (1 - alpha)
+                for i in range(self.num-flag):
+                    feat = self.decoders[i](feat)
 
-        if feat.size()!=size:
-            feat = torch.from_numpy(cv2.resize(feat[0].transpose(0, 1).transpose(1, 2).cpu().numpy(),(size[3],size[2]))).cuda().unsqueeze(0)
-            feat = feat.permute(0,3,1,2)
+        if feat.size() != size:
+            feat = torch.from_numpy(cv2.resize(feat[0].transpose(0, 1).transpose(1, 2).cpu().numpy(), (size[3], size[2]))).cuda().unsqueeze(0)
+            feat = feat.permute(0, 3, 1, 2)
         return feat
             
     def load_style_img(self, args, content=None, wh=None):
