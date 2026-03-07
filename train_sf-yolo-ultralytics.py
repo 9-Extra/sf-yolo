@@ -134,7 +134,6 @@ class SFYOLOTrainer(DetectionTrainer):
         self.fc1_path = overrides.pop('fc1', None)
         self.fc2_path = overrides.pop('fc2', None)
         self.style_path = overrides.pop('style_path', '')
-        self.compile_tam = overrides.pop('compile_tam', False)
         self.style_add_alpha = overrides.pop('style_add_alpha', 1.0)
         self.save_style_samples = overrides.pop('save_style_samples', False)
         self.random_style = self.style_path == ''
@@ -225,7 +224,7 @@ class SFYOLOTrainer(DetectionTrainer):
             tam_args.log_dir = str(self.save_dir / 'enhance_style_samples')
             tam_args.save_style_samples = self.save_style_samples
             tam_args.imgs_paths = []
-            tam_args.compile_tam = self.compile_tam
+            tam_args.compile_tam = self.args.compile
             
             self.tam_args = tam_args
             self.adain = enhance_vgg16(tam_args)
@@ -1272,11 +1271,8 @@ def parse_args():
     parser.add_argument("--debug_save_dir", type=str, default="./check", help="调试图像保存目录")
     
     # torch.compile 参数
-    parser.add_argument("--compile", type=str, default=False, 
+    parser.add_argument("--compile", type=str, default=True, 
                         help="使用 torch.compile 编译模型以提高训练速度，可选: 'default', 'reduce-overhead', 'max-autotune-no-cudagraphs', True, False")
-    parser.add_argument("--compile-tam", type=str, default=False,
-                        help="使用 torch.compile 编译 TAM 模块，可选: 'default', 'reduce-overhead', 'max-autotune-no-cudagraphs', True, False")
-
     return parser.parse_args()
 
 
@@ -1358,8 +1354,7 @@ def main():
         'amp': args.amp,
         'freeze': args.freeze,
         'cache': args.cache,
-        'compile': args.compile,
-        'compile_tam': args.compile_tam
+        'compile': args.compile
     }
     
     # 创建训练器并开始训练

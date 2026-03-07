@@ -162,8 +162,6 @@ class enhance_base:
         创建 TAMWrapper 包装器并编译，以提高推理速度。
         """
         compile_mode = args.compile_tam if isinstance(args.compile_tam, str) else 'default'
-        prefix = "[TAM compile]"
-        print(f"{prefix} starting torch.compile with '{compile_mode}' mode...")
         
         try:
             # 创建包装器并移动到 GPU
@@ -173,12 +171,9 @@ class enhance_base:
             wrapper.eval()
             
             # 编译包装器
-            import time
-            t0 = time.perf_counter()
             self.compiled_wrapper = torch.compile(wrapper, mode=compile_mode, backend='inductor')
-            t_compile = time.perf_counter() - t0
             
-            print(f"{prefix} compile complete in {t_compile:.1f}s")
+            print(f"TAM compiled")
             
         except Exception as e:
             print(f"{prefix} torch.compile failed, continuing uncompiled: {e}")
