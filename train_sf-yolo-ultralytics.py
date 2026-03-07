@@ -262,6 +262,8 @@ class SFYOLOTrainer(DetectionTrainer):
                     # 检查 YAML 加载结果
                     if source_data_dict is None:
                         raise ValueError(f"无法加载源域 YAML 文件: {self.source_data}")
+                    if not isinstance(source_data_dict, dict):
+                        raise ValueError(f"源域 YAML 文件格式错误，期望字典类型，得到 {type(source_data_dict)}: {self.source_data}")
                     
                     # 获取源域验证集路径
                     if isinstance(source_data_dict.get('val'), list):
@@ -291,6 +293,7 @@ class SFYOLOTrainer(DetectionTrainer):
                         stride=self.model.stride.max().item() if hasattr(self.model, 'stride') else 32,
                         pad=0.5,
                         task=getattr(self, 'task', 'detect'),
+                        data=source_data_dict,
                     )
                     
                     # 构建源域验证数据加载器
@@ -332,7 +335,7 @@ class SFYOLOTrainer(DetectionTrainer):
             except Exception as e:
                 LOGGER.warning(f"{colorstr('SF-YOLO:')} 源域验证失败: {e}")
                 import traceback
-                LOGGER.debug(traceback.format_exc())
+                LOGGER.warning(traceback.format_exc())
                 metrics_source = None
         
         # 存储源域指标供后续使用（如保存指标到CSV）
