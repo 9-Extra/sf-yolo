@@ -399,7 +399,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
             # Forward
             with torch.amp.autocast("cuda", enabled=amp):
-                imgs_style = get_style_images(imgs_255, opt, adain) / 255
+                imgs_style = get_style_images(imgs_255, adain) / 255
                     
                 # Teacher forward 
                 model_teacher.eval()

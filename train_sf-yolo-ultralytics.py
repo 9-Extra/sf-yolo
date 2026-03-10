@@ -520,7 +520,7 @@ class SFYOLOTrainer(DetectionTrainer):
         imgs_255 = imgs * 255.0
         
         # 应用风格迁移
-        styled_imgs = get_style_images(imgs_255, self.tam_args, self.adain) / 255.0
+        styled_imgs = get_style_images(imgs_255, self.adain) / 255.0
         
         return styled_imgs
     
