@@ -142,10 +142,9 @@ class TAMWrapper(nn.Module):
         Returns:
             tuple: (均值 [N, C, 1, 1], 标准差 [N, C, 1, 1])
         """
-        N, C = feat.size()[:2]
-        feat_var = feat.view(N, C, -1).var(dim=2) + eps
-        feat_std = feat_var.sqrt().view(N, C, 1, 1)
-        feat_mean = feat.view(N, C, -1).mean(dim=2).view(N, C, 1, 1)
+        feat_std, feat_mean = torch.std_mean(feat, dim=[2, 3], unbiased=False, keepdim=True)        
+        # 添加 epsilon 防止除零
+        feat_std = feat_std + eps
         return feat_mean, feat_std
 
 
@@ -219,8 +218,9 @@ class enhance_base:
                 # 逐张图像进行风格迁移
                 output = []
                 for i in range(0, content.shape[0]):
+                    # style_transfer 返回 [1, C, H, W]，使用 cat 而不是 stack
                     output.append(self.style_transfer(content[i], style, flag, self.alpha))
-                output = torch.stack(output)
+                output = torch.cat(output, dim=0)  # 在 batch 维度拼接，得到 [N, C, H, W]
         
         # 第一层输出需要进行后处理：添加像素均值、裁剪到有效范围
         if flag == 0:

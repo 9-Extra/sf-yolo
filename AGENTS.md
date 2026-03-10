@@ -1,176 +1,22 @@
 # AGENTS.md
 
-本项目使用 `uv` 作为 Python 包管理器和运行环境。
+本项目实现了sf-yolo域适应方法，可以将在源域（比如非雾天环境）训练的目标检测模型微调至适用于目标域（比如雾天环境）。与常规微调的不同之处在于域适应方法只需要目标域的图像，而不需要其标柱。
 
 ## 环境配置
 
-## 使用 uv 运行脚本
-
-### 运行 Python 脚本
-
-使用 `uv run` 来运行 Python 脚本，这会自动使用项目配置的虚拟环境：
-
-```bash
-# 运行训练脚本
-uv run train_sf-yolo.py
-
-# 运行验证脚本
-uv run val.py
-
-# 运行其他脚本
-uv run benchmarks.py
-```
-
-### 管理依赖
-
-所有依赖都在 `pyproject.toml` 中定义，使用以下命令管理：
-
-```bash
-# 安装项目依赖（根据 pyproject.toml 和 uv.lock）
-uv sync
-
-# 添加新依赖
-uv add <package-name>
-
-# 添加开发依赖
-uv add --dev <package-name>
-
-# 更新依赖
-uv sync --upgrade
-
-# 更新特定包
-uv add --upgrade <package-name>
-```
-
-### 进入项目环境
-
-如果需要进入交互式 Python shell 或手动执行命令：
-
-```bash
-# 进入项目的 Python 环境
-uv run python
-
-# 或者使用 uv run 直接执行命令
-uv run python -c "import torch; print(torch.__version__)"
-```
-
-## 重要提示
-
-- **不要**直接使用系统 Python 或 pip 运行脚本或安装包
-- 项目使用清华镜像源加速依赖下载，并在需要时从 PyTorch 官方源安装 CUDA 版本的 torch/torchvision
+- 使用 `uv run` 来运行 Python 脚本，使用`uv add`来安装依赖，这会自动使用项目配置的虚拟环境，**不要**直接使用系统 Python 或 pip 运行脚本或安装包
 - 如果项目根目录下存在ENVIRONMENT.md，请遵循其中的说明
+- 无视readme.md中关于环境配置的内容
 
-## 项目依赖说明
+## 数据集
 
-主要依赖包括：
-- PyTorch (CUDA 13.0 版本)
-- ultralytics
-- 其他数据处理和可视化库
+1. CityScape数据集 
+已预先转化为Yolo所需格式。源域数据位于（正常天气）"datasets/cityscape_yolo/cityscapes.yaml"，以及目标域数据（雾天）位于"datasets/cityscape_yolo_foggy/cityscapes.yaml"。如果数据集出现问题，请暂停任务向用户询问。
 
-详见 `pyproject.toml` 获取完整依赖列表。
+## 目标检测模型
 
-## 模型训练与验证
-
-### YOLOv26 训练（Ultralytics）
-
-使用最新的 YOLOv26 模型在 Cityscapes 源域数据上训练：
-
-```python
-# train_yolo26.py
-from ultralytics import YOLO
-
-# 加载 YOLOv26n (Nano) 模型
-model = YOLO("yolo26n.pt")
-
-# 训练配置
-results = model.train(
-    data="path/to/cityscapes.yaml",
-    epochs=100,
-    imgsz=960,
-    batch=16,
-    device=0,
-    workers=4,
-    patience=20,
-    project="runs/train_yolo26",
-    name="cityscapes_baseline",
-    exist_ok=True,
-)
-```
-
-运行训练：
-```bash
-uv run python train_yolo26.py
-```
-
-**模型选择**：
-- `yolo26n.pt` - Nano (2.4M 参数，最快)
-- `yolo26s.pt` - Small
-- `yolo26m.pt` - Medium
-- `yolo26l.pt` - Large
-- `yolo26x.pt` - Extra Large
-
-### YOLOv26 验证
-
-在源域或目标域上验证训练好的 YOLOv26 模型：
-
-```python
-# validate_yolo26.py
-from ultralytics import YOLO
-
-# 加载训练好的模型
-model = YOLO("source_weights/yolov26l_cityscapes.pt")
-
-# 在源域（Cityscapes）验证
-metrics_source = model.val(
-    data="path/to/cityscapes.yaml",
-    imgsz=960,
-    batch=16,
-    verbose=False
-)
-print(f"Source - mAP@50: {metrics_source.box.map50:.4f}")
-
-# 在目标域（Foggy Cityscapes）验证
-metrics_target = model.val(
-    data="path/to/cityscapes_foggy.yaml",
-    imgsz=960,
-    batch=16,
-    verbose=False
-)
-print(f"Target - mAP@50: {metrics_target.box.map50:.4f}")
-```
-
-运行验证：
-```bash
-uv run python validate_yolo26.py
-```
-
-### YOLOv5 基线模型验证
-
-验证预训练的 YOLOv5 基线模型（`source_weights/yolov5l_cityscapes.pt`）：
-
-**在源域（Cityscapes）验证：**
-```bash
-uv run val.py \
-    --weights source_weights/yolov5l_cityscapes.pt \
-    --data path/to/cityscapes.yaml \
-    --imgsz 960 \
-    --batch-size 16 \
-    --task val
-```
-
-**在目标域（Foggy Cityscapes）验证：**
-```bash
-uv run val.py \
-    --weights source_weights/yolov5l_cityscapes.pt \
-    --data path/to/cityscapes_foggy.yaml \
-    --imgsz 960 \
-    --batch-size 16 \
-    --task val
-```
-
-### 数据准备
-
-#### Cityscapes 原始数据（源域）
-
-需要使用cityscape2yolo.py预先将原始 Cityscapes 数据已转换为 YOLO 格式
-
+目前使用了两种目标检测模型，因为实现框架不同，导致其训练和验证的脚本和行为存在差异，不能混用
+1. Yolov26
+使用来自ultralytics库的实现，训练和验证直接使用ultralytics库功能，可参照train_yolo26_cityscapes.py和train_yolo26_cityscapes.py，其sf-yolo训练则通过自定义训练器实现于train_sf-yolo-ultralytics.py。在源域上预训练的权重为source_weights/yolov26l_cityscapes.pt。
+2. Yolov5
+基本在本项目内实现，少量依赖ultralytics库，但模型与ultralytics内的Yolov5存在一定差别，故必须使用本项目内脚本进行加载，训练和验证。其训练脚本为train_source.py，验证脚本为val.py，sf-yolo训练则使用train_sf-yolo.py。在源域上预训练的权重位于source_weights/yolov5l_cityscapes.pt。
