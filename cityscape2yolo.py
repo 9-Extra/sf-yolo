@@ -48,6 +48,9 @@ def convert_cityscapes_to_yolov8(json_path, output_file, class_mapping):
     img_height = data['imgHeight']
     
     annotations = []
+    seen = set()  # 用于去重
+    duplicates_count = 0  # 统计重复数
+    
     for obj in data['objects']:
         label = obj['label']
         if label not in class_mapping:
@@ -55,7 +58,19 @@ def convert_cityscapes_to_yolov8(json_path, output_file, class_mapping):
         class_id = class_mapping[label]
         polygon = obj['polygon']
         bbox = polygon_to_bbox(polygon, img_width, img_height)
+        
+        # 创建唯一键用于去重（保留6位小数精度）
+        key = (class_id, round(bbox[0], 6), round(bbox[1], 6), round(bbox[2], 6), round(bbox[3], 6))
+        
+        if key in seen:
+            duplicates_count += 1
+            continue  # 跳过重复标签
+        
+        seen.add(key)
         annotations.append((class_id, *bbox))
+    
+    if duplicates_count > 0:
+        print(f"  [去重] {json_path}: 移除 {duplicates_count} 个重复标签")
     
     with open(output_file, 'w') as out_file:
         for ann in annotations:
