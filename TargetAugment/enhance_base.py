@@ -210,27 +210,20 @@ class enhance_base:
                 )
         
         # 执行风格迁移（无梯度）
-        with torch.no_grad():
+        with torch.inference_mode():
             if self.compiled_wrapper is not None:
                 # 使用编译后的整体模型进行批量推理
                 output = self.compiled_wrapper(content, style.unsqueeze(0), flag, self.alpha)
             else:
-                # 逐张图像进行风格迁移
-                output = []
-                for i in range(0, content.shape[0]):
-                    # style_transfer 返回 [1, C, H, W]，使用 cat 而不是 stack
-                    output.append(self.style_transfer(content[i], style, flag, self.alpha))
-                output = torch.cat(output, dim=0)  # 在 batch 维度拼接，得到 [N, C, H, W]
+                output = self.style_transfer(content, style.unsqueeze(0), flag, self.alpha)
         
         # 第一层输出需要进行后处理：添加像素均值、裁剪到有效范围
+        # output: [N, C, H, W]
+        # self.pixel_means_tensor: [C, 1, 1]
         if flag == 0:
-            output = (
-                output.permute(0, 2, 3, 1) + 
-                torch.from_numpy(self.pixel_means).float().cuda()
-            ).clamp(0, 255)
-            output = output.permute(0, 3, 1, 2).contiguous()
-        
-        return output.detach()
+            output = (output + self.pixel_means_tensor).clamp_(0, 255)
+            
+        return output.detach_()
 
     def __init__(self, args, encoders, decoders, fcs):
         """初始化风格迁移基类
@@ -245,6 +238,7 @@ class enhance_base:
         
         # 图像预处理参数（ImageNet 预训练模型的像素均值）
         self.pixel_means = np.array([[[102.9801, 115.9465, 122.7717]]])
+        self.pixel_means_tensor = torch.from_numpy(self.pixel_means).permute(2, 0, 1).float().contiguous() # [3, 1, 1]
         self.target_size = args.imgsz
         self.encoders = encoders
         self.num = len(self.encoders)
@@ -257,6 +251,7 @@ class enhance_base:
         
         # 将模型移动到 GPU 并设置为评估模式
         if args.cuda:
+            self.pixel_means_tensor = self.pixel_means_tensor.cuda()
             for encoder in self.encoders:
                 encoder.cuda()
             for decoder in self.decoders:
@@ -364,43 +359,33 @@ class enhance_base:
         return im
     
     def style_transfer(self, content: torch.Tensor, style, flag, alpha=1.0):
-        """单张图像的风格迁移
-        
-        对单张图像执行完整的编码-解码风格迁移流程。
-        如果 compiled_wrapper 可用，会使用编译后的版本。
-        
+        """风格迁移
+          
         Args:
-            content: 内容图像 [C, H, W]
-            style: 风格图像 [C, H, W]
+            content: 内容图像 [N, C, H, W]
+            style: 风格图像 [1, C, H, W]
             flag: 编码器起始层索引
             alpha: 风格迁移强度 [0, 1]
             
         Returns:
-            torch.Tensor: 风格化后的图像 [1, C, H, W]
+            torch.Tensor: 风格化后的图像 [N, C, H, W]
         """
         assert (0.0 <= alpha <= 1.0)
-        assert (len(content.size()) == 3)
-        content = content.unsqueeze(0)  # 添加批次维度
-        style = style.unsqueeze(0)
+        assert (len(content.size()) == 4)
         size = content.size()
-        
-        # 使用编译后的包装器（如果可用）
-        if self.compiled_wrapper is not None:
-            with torch.no_grad():
-                feat = self.compiled_wrapper(content, style, flag, alpha)
-        else:
-            # 原始实现：手动编码-解码
-            with torch.no_grad():
-                # 编码阶段
-                for i in range(flag, self.num):
-                    content = self.encoders[i](content).float()
-                    style = self.encoders[i](style).float()
-                # 自适应实例归一化
-                feat = self.adaptive_instance_normalization(content, style, self.fc1, self.fc2)
-                feat = feat * alpha + content * (1 - alpha)
-                # 解码阶段
-                for i in range(self.num - flag):
-                    feat = self.decoders[i](feat)
+    
+        # 手动编码-解码
+        with torch.no_grad():
+            # 编码阶段
+            for i in range(flag, self.num):
+                content = self.encoders[i](content).float()
+                style = self.encoders[i](style).float()
+            # 自适应实例归一化
+            feat = self.adaptive_instance_normalization(content, style, self.fc1, self.fc2)
+            feat = feat * alpha + content * (1 - alpha)
+            # 解码阶段
+            for i in range(self.num - flag):
+                feat = self.decoders[i](feat)
 
         assert feat.size() == size, f"TAM 生成图像的大小{feat.shape}和需要的大小{size}不一致"
         return feat
@@ -535,35 +520,42 @@ class enhance_base:
         return feat_flatten, mean, std
 
     def adaptive_instance_normalization(self, content_feat, style_feat, fc1, fc2):
-        """自适应实例归一化（单张图像版本）
+        """自适应实例归一化 (Adaptive Instance Normalization)
         
-        与 _adaptive_instance_normalization 功能相同，但处理单张图像。
+        将内容特征的统计特性（均值和标准差）替换为风格特征的统计特性，
+        同时通过全连接层学习更复杂的风格迁移映射。
         
         Args:
-            content_feat: 内容特征 [1, C, H, W]
+            content_feat: 内容特征 [N, C, H, W]
             style_feat: 风格特征 [1, C, H, W]
-            fc1: 风格均值预测全连接层
-            fc2: 风格标准差预测全连接层
             
         Returns:
-            torch.Tensor: 融合后的特征 [1, C, H, W]
+            torch.Tensor: 融合后的特征 [N, C, H, W]
         """
-        assert (content_feat.size()[:2] == style_feat.size()[:2])
         size = content_feat.size()
-        style_mean, style_std = self.calc_mean_std(style_feat)
-        content_mean, content_std = self.calc_mean_std(content_feat)
-
-        normalized_feat = (
-            content_feat - content_mean.expand(size)
-        ) / content_std.expand(size)
+        batch_size = size[0]  # 批次大小 N
         
-        mixed_style_mean = torch.cat((style_mean, content_mean), 1).squeeze(2).squeeze(2)
-        mixed_style_std = torch.cat((style_std, content_std), 1).squeeze(2).squeeze(2)
-
-        new_style_mean = (fc1(mixed_style_mean)).unsqueeze(2).unsqueeze(2)
-        new_style_std = (fc2(mixed_style_std)).unsqueeze(2).unsqueeze(2)
-        final = normalized_feat * new_style_std.expand(size) + new_style_mean.expand(size)
-        return final
+        # 计算风格和内容特征的均值和标准差
+        style_mean, style_std = self.calc_mean_std(style_feat)  # [1, C, 1, 1]
+        content_mean, content_std = self.calc_mean_std(content_feat)  # [N, C, 1, 1]
+        
+        # 对内容特征进行归一化
+        normalized_feat = (content_feat - content_mean) / content_std  # [N, C, H, W]
+        
+        # 将风格统计信息和内容统计信息拼接，用于全连接层预测
+        mixed_style_mean = torch.cat(
+            (style_mean.expand(batch_size, -1, -1, -1), content_mean), 1
+        ).squeeze((2, 3))  # [N, 2C]
+        mixed_style_std = torch.cat(
+            (style_std.expand(batch_size, -1, -1, -1), content_std), 1
+        ).squeeze((2, 3))  # [N, 2C]
+        
+        # 通过全连接层预测新的风格统计信息
+        new_style_mean = fc1(mixed_style_mean)[:, :, None, None]  # [N, C, 1, 1]
+        new_style_std = fc2(mixed_style_std)[:, :, None, None]  # [N, C, 1, 1]
+        
+        # 使用预测的风格统计信息对归一化后的特征进行缩放和平移
+        return normalized_feat * new_style_std + new_style_mean
 
     def calc_mean_std(self, feat, eps=1e-5):
         """计算特征的均值和标准差（4D 张量版本）

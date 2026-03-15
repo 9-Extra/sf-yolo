@@ -25,13 +25,21 @@ names: {names}  # class names
 
 """
 
-def polygon_to_normalized_coords(polygon, img_width, img_height):
-    normalized_coords = []
-    for point in polygon:
-        x_norm = point[0] / img_width
-        y_norm = point[1] / img_height
-        normalized_coords.append((x_norm, y_norm))
-    return normalized_coords
+def polygon_to_bbox(polygon, img_width, img_height):
+    """将多边形转换为YOLO格式边界框 (center_x, center_y, width, height)"""
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    
+    # 转换为YOLO格式 (中心点归一化坐标 + 宽高归一化)
+    bbox_width = (x_max - x_min) / img_width
+    bbox_height = (y_max - y_min) / img_height
+    center_x = ((x_min + x_max) / 2) / img_width
+    center_y = ((y_min + y_max) / 2) / img_height
+    
+    return [center_x, center_y, bbox_width, bbox_height]
 
 def convert_cityscapes_to_yolov8(json_path, output_file, class_mapping):
     data = json.load(open(json_path))
@@ -46,9 +54,8 @@ def convert_cityscapes_to_yolov8(json_path, output_file, class_mapping):
             continue
         class_id = class_mapping[label]
         polygon = obj['polygon']
-        norm_coords = polygon_to_normalized_coords(polygon, img_width, img_height)
-        flattened_coords = [coord for point in norm_coords for coord in point]
-        annotations.append((class_id, *flattened_coords))
+        bbox = polygon_to_bbox(polygon, img_width, img_height)
+        annotations.append((class_id, *bbox))
     
     with open(output_file, 'w') as out_file:
         for ann in annotations:
@@ -120,29 +127,32 @@ class_mapping = {
     'vegetation': 255,
     'terrain': 255,
     'sky': 255,
-    'person': 4,
-    'rider': 5,
+    'person': 0,
+    'rider': 1,
     'car': 2,
-    'truck': 7,
-    'bus': 0,
+    'truck': 3,
+    'bus': 4,
     'caravan': 255,
     'trailer': 255,
-    'train': 6,
-    'motorcycle': 3,
-    'bicycle': 1,
+    'train': 5,
+    'motorcycle': 6,
+    'bicycle': 7,
     'license plate': 255,
 }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert Cityscapes dataset to YOLO format")
-    parser.add_argument("--image_path", type=str, default="leftImg8bit", help="Path to the Cityscapes image folder")
-    parser.add_argument("--source_label_path", type=str, default="gtFine", help="Path to the Cityscapes label folder")
-    parser.add_argument("--output_dir", type=str, default="yolov5_format", help="Output directory for YOLO format")
+    parser.add_argument("--image_path", type=str, default="datasets/cityscapes/leftImg8bit", help="Path to the Cityscapes image folder")
+    parser.add_argument("--source_label_path", type=str, default="datasets/cityscapes/gtFine", help="Path to the Cityscapes label folder")
+    parser.add_argument("--output_dir", type=str, default="datasets/cityscapes/cityscape_yolo", help="Output directory for YOLO format")
     parser.add_argument("--foggy_beta", type=str, choices=["", "_foggy_beta_0.005", "_foggy_beta_0.01", "_foggy_beta_0.02"], default="", help="foggy beta value")
     
     args = parser.parse_args()
     
     class_mapping = {k: v for k, v in class_mapping.items() if v != 255}
+    # 按id排序
+    class_mapping = {k: v for k, v in sorted(class_mapping.items(), key=lambda item: item[1])}
+    
     process_folder(args.image_path, args.source_label_path, args.output_dir, args.foggy_beta, class_mapping)
 
     # You can use the rename command to make the names of the original image files and annotation files the same.

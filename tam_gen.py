@@ -222,6 +222,7 @@ def get_image_files(input_path):
 
 def main():
     """主函数"""
+    torch.set_float32_matmul_precision('high')
     args = parse_args()
     
     # 设置设备

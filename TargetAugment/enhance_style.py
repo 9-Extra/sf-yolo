@@ -1,23 +1,4 @@
 # coding=utf-8
-"""
-风格迁移简化接口模块
-
-提供对风格迁移功能的简化封装，主要用于：
-- 快速应用风格迁移到输入图像
-- 作为高层接口供其他模块调用
-
-主要函数:
-    get_style_images: 对输入图像应用风格迁移
-
-使用示例:
-    >>> from TargetAugment.enhance_vgg16 import enhance_vgg16
-    >>> from TargetAugment.enhance_style import get_style_images
-    >>> adain = enhance_vgg16(args)
-    >>> styled_images = get_style_images(images, adain)
-"""
-
-import numpy as np
-import torch
 from TargetAugment.enhance_vgg16 import enhance_vgg16
 
 
@@ -45,7 +26,6 @@ def get_style_images(im_data, adain: enhance_vgg16):
         >>> # 结果可以直接用于训练或保存
     """
     # 应用风格到图像
-    # 公式: styled = im_data * 0 + 1 * add_style(im_data, 0)
     # 这实际上就是直接返回 add_style 的结果
     styled_im_data = im_data * 0 + 1 * adain.add_style(im_data, 0)
     
