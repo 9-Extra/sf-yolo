@@ -144,7 +144,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert Cityscapes dataset to YOLO format")
     parser.add_argument("--image_path", type=str, default="datasets/cityscapes/leftImg8bit", help="Path to the Cityscapes image folder")
     parser.add_argument("--source_label_path", type=str, default="datasets/cityscapes/gtFine", help="Path to the Cityscapes label folder")
-    parser.add_argument("--output_dir", type=str, default="datasets/cityscapes/cityscape_yolo", help="Output directory for YOLO format")
+    parser.add_argument("--output_dir", type=str, default="datasets/cityscape_yolo", help="Output directory for YOLO format")
     parser.add_argument("--foggy_beta", type=str, choices=["", "_foggy_beta_0.005", "_foggy_beta_0.01", "_foggy_beta_0.02"], default="", help="foggy beta value")
     
     args = parser.parse_args()
